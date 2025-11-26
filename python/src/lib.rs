@@ -53,7 +53,7 @@ use lance_index::DatasetIndexExt;
 use log::Level;
 use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
+use pyo3::types::{PyAny, PyAnyMethods, PyCapsule, PyDict};
 use scanner::ScanStatistics;
 use session::Session;
 
@@ -286,6 +286,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(language_model_home))?;
     m.add_wrapped(wrap_pyfunction!(bytes_read_counter))?;
     m.add_wrapped(wrap_pyfunction!(iops_counter))?;
+    m.add_wrapped(wrap_pyfunction!(enabled_features))?;
     m.add_wrapped(wrap_pyfunction!(stable_version))?;
     // Debug functions
     m.add_wrapped(wrap_pyfunction!(debug::format_schema))?;
@@ -307,6 +308,16 @@ fn iops_counter() -> PyResult<u64> {
 #[pyfunction(name = "bytes_read_counter")]
 fn bytes_read_counter() -> PyResult<u64> {
     Ok(::lance::io::bytes_read_counter())
+}
+
+/// Return a dictionary of enabled Cargo features for the embedded Lance library.
+#[pyfunction]
+pub fn enabled_features(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    let dict = PyDict::new(py);
+    for feature in ::lance::enabled_features() {
+        dict.set_item(*feature, true)?;
+    }
+    Ok(dict.into())
 }
 
 #[pyfunction(name = "_schema_to_json")]

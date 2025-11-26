@@ -87,6 +87,14 @@ pub mod utils;
 pub use dataset::Dataset;
 use lance_index::vector::DIST_COL;
 
+// Generated at build time from enabled Cargo features.
+include!(concat!(env!("OUT_DIR"), "/features.rs"));
+
+/// Return the list of Cargo features enabled for this crate at build time.
+pub fn enabled_features() -> &'static [&'static str] {
+    BUILD_FEATURES
+}
+
 /// Creates and loads a [`Dataset`] from the given path.
 /// Infers the storage backend to use from the scheme in the given table path.
 ///
