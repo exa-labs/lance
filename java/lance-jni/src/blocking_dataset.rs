@@ -767,16 +767,8 @@ fn inner_create_index(
     let index_uuid = env.get_string_opt(&index_uuid_jobj)?;
 
     // Handle scalar vs vector indices differently and get params before borrowing dataset
-    let params_result: Result<Box<dyn IndexParams>> = match index_type {
-        IndexType::Scalar
-        | IndexType::BTree
-        | IndexType::Bitmap
-        | IndexType::LabelList
-        | IndexType::Inverted
-        | IndexType::NGram
-        | IndexType::ZoneMap
-        | IndexType::BloomFilter => {
-            // For scalar indices, create a scalar IndexParams
+    let params_result: Result<Box<dyn IndexParams>> = match index_param_kind(index_type) {
+        IndexParamKind::Scalar => {
             let (index_type_str, params_opt) = get_scalar_index_params(env, params_jobj)?;
             let scalar_params = lance_index::scalar::ScalarIndexParams {
                 index_type: index_type_str,
@@ -784,24 +776,11 @@ fn inner_create_index(
             };
             Ok(Box::new(scalar_params))
         }
-        IndexType::FragmentReuse | IndexType::MemWal => {
-            // System indices - not user-creatable
-            Err(Error::input_error(format!(
-                "Cannot create system index type: {:?}. System indices are managed internally.",
-                index_type
-            )))
-        }
-        IndexType::Vector
-        | IndexType::IvfFlat
-        | IndexType::IvfSq
-        | IndexType::IvfPq
-        | IndexType::IvfRq
-        | IndexType::IvfHnswSq
-        | IndexType::IvfHnswPq
-        | IndexType::IvfHnswFlat => {
-            // For vector indices, use the existing parameter handling
-            get_vector_index_params(env, params_jobj)
-        }
+        IndexParamKind::System => Err(Error::input_error(format!(
+            "Cannot create system index type: {:?}. System indices are managed internally.",
+            index_type
+        ))),
+        IndexParamKind::Vector => get_vector_index_params(env, params_jobj),
     };
 
     let params = params_result?;
@@ -835,6 +814,49 @@ fn inner_create_index(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Copy, Clone)]
+enum IndexParamKind {
+    Scalar,
+    Vector,
+    System,
+}
+
+fn index_param_kind(index_type: IndexType) -> IndexParamKind {
+    match index_type {
+        IndexType::Scalar
+        | IndexType::BTree
+        | IndexType::Bitmap
+        | IndexType::LabelList
+        | IndexType::Inverted
+        | IndexType::NGram
+        | IndexType::ZoneMap
+        | IndexType::BloomFilter => IndexParamKind::Scalar,
+        IndexType::FragmentReuse | IndexType::MemWal => IndexParamKind::System,
+        IndexType::Vector
+        | IndexType::IvfFlat
+        | IndexType::IvfSq
+        | IndexType::IvfPq
+        | IndexType::IvfRq
+        | IndexType::IvfHnswSq
+        | IndexType::IvfHnswPq
+        | IndexType::IvfHnswFlat
+        | IndexType::IvfHnswRq => IndexParamKind::Vector,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_param_kind_covers_ivf_hnsw_rq() {
+        assert!(matches!(
+            index_param_kind(IndexType::IvfHnswRq),
+            IndexParamKind::Vector
+        ));
+    }
 }
 
 #[no_mangle]
