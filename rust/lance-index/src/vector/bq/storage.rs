@@ -47,10 +47,16 @@ pub struct RabitQuantizationMetadata {
     pub rotate_mat: Option<FixedSizeListArray>,
     pub rotate_mat_position: u32,
     pub num_bits: u8,
-    #[serde(default = "default_true")]
-    pub pack: bool,
-    #[serde(default)]
-    pub packed: bool,
+    /// Whether the in-memory storage should use the packed code layout.
+    ///
+    /// This is serialized as `pack` for backwards compatibility.
+    #[serde(rename = "pack", default = "default_true")]
+    pub use_packed_codes: bool,
+    /// Whether the codes in the storage batch are already packed.
+    ///
+    /// This is serialized as `packed` for backwards compatibility.
+    #[serde(rename = "packed", default)]
+    pub codes_are_packed: bool,
 }
 
 fn default_true() -> bool {
@@ -451,7 +457,7 @@ impl VectorStore for RabitQuantizationStorage {
             dist_table,
             sum_q,
             codes,
-            self.metadata.packed,
+            self.metadata.codes_are_packed,
             self.add_factors.values(),
             self.scale_factors.values(),
             q_factor,
@@ -472,7 +478,7 @@ impl VectorStore for RabitQuantizationStorage {
             id,
             num_vectors,
             code_len,
-            self.metadata.packed,
+            self.metadata.codes_are_packed,
         )
         .collect();
 
@@ -505,7 +511,7 @@ impl VectorStore for RabitQuantizationStorage {
             dist_table,
             sum_q,
             codes_values,
-            self.metadata.packed,
+            self.metadata.codes_are_packed,
             self.add_factors.values(),
             self.scale_factors.values(),
             query_factor,
@@ -682,12 +688,12 @@ impl QuantizerStorage for RabitQuantizationStorage {
             .clone();
 
         let mut metadata = metadata.clone();
-        let (batch, codes) = match (metadata.pack, metadata.packed) {
+        let (batch, codes) = match (metadata.use_packed_codes, metadata.codes_are_packed) {
             (true, false) => {
                 let codes = pack_codes(&codes);
                 let batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(codes))?;
                 let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
-                metadata.packed = true;
+                metadata.codes_are_packed = true;
                 (batch, codes)
             }
             _ => (batch, codes),
@@ -739,7 +745,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
                         i,
                         num_vectors,
                         num_code_bytes,
-                        self.metadata.packed,
+                        self.metadata.codes_are_packed,
                     ));
                 }
                 Some(None) => {}
@@ -751,7 +757,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
                         i,
                         num_vectors,
                         num_code_bytes,
-                        self.metadata.packed,
+                        self.metadata.codes_are_packed,
                     ));
                 }
             }
@@ -766,11 +772,11 @@ impl QuantizerStorage for RabitQuantizationStorage {
         let batch = if new_row_ids.is_empty() {
             RecordBatch::new_empty(self.schema().clone())
         } else {
-            let codes: Arc<FixedSizeListArray> = if metadata.pack {
-                metadata.packed = true;
+            let codes: Arc<FixedSizeListArray> = if metadata.use_packed_codes {
+                metadata.codes_are_packed = true;
                 Arc::new(pack_codes(&new_codes))
             } else {
-                metadata.packed = false;
+                metadata.codes_are_packed = false;
                 Arc::new(new_codes)
             };
             self.batch
@@ -957,8 +963,8 @@ mod tests {
             rotate_mat: None,
             rotate_mat_position: 0,
             num_bits: 1,
-            pack: true,
-            packed: true,
+            use_packed_codes: true,
+            codes_are_packed: true,
         };
         let storage =
             RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
@@ -976,7 +982,7 @@ mod tests {
             .values()
             .to_vec();
         assert_eq!(stored_codes, expected_codes);
-        assert!(storage.metadata().packed);
+        assert!(storage.metadata().codes_are_packed);
     }
 
     #[test]
@@ -1036,14 +1042,14 @@ mod tests {
         .unwrap();
 
         let mut metadata = rq.metadata(None);
-        metadata.pack = false;
-        metadata.packed = false;
+        metadata.use_packed_codes = false;
+        metadata.codes_are_packed = false;
         let storage =
             RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
                 .unwrap();
 
-        assert!(!storage.metadata().pack);
-        assert!(!storage.metadata().packed);
+        assert!(!storage.metadata().use_packed_codes);
+        assert!(!storage.metadata().codes_are_packed);
 
         let stored_codes = storage
             .codes

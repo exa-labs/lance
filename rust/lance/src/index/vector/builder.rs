@@ -903,7 +903,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         .as_any()
                         .downcast_ref::<lance_index::vector::bq::storage::RabitQuantizationStorage>(
                         )
-                        .map(|s| s.metadata().packed)
+                        .map(|s| s.metadata().codes_are_packed)
                         .unwrap_or(true);
                     for batch in part_batches.iter_mut() {
                         if batch.num_rows() == 0 {
