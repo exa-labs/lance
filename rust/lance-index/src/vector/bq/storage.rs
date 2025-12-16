@@ -470,7 +470,7 @@ impl VectorStore for RabitQuantizationStorage {
         )
         .collect();
 
-        // reconstruct a signed query vector (+1/-1) from the binary codes
+        // Reconstruct a signed query vector (+1/-1) from the binary codes.
         let dim = (code_len * (u8::BITS as usize)) / (self.metadata.num_bits as usize);
         let mut rotated_query = Vec::with_capacity(dim);
         for (byte_idx, byte) in query_code.iter().enumerate() {
@@ -482,6 +482,18 @@ impl VectorStore for RabitQuantizationStorage {
                 let sign = if (byte >> bit) & 1 == 1 { 1.0 } else { -1.0 };
                 rotated_query.push(sign);
             }
+        }
+
+        // Scale the reconstructed rotated query so that ||q_r||^2 ≈ stored residual norm.
+        match self.distance_type {
+            DistanceType::L2 | DistanceType::Dot => {
+                let res_norm_sq = self.add_factors.value(id);
+                if res_norm_sq.is_finite() && res_norm_sq > 0.0 {
+                    let scale = (res_norm_sq / dim as f32).sqrt();
+                    rotated_query.iter_mut().for_each(|v| *v *= scale);
+                }
+            }
+            _ => {}
         }
 
         let dist_table = build_dist_table_direct::<Float32Type>(&rotated_query);
