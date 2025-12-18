@@ -2738,8 +2738,13 @@ class LanceDataset(pa.dataset.Dataset):
             - ivf_centroids
                 Existing K-mean centroids for IVF clustering.
             - num_bits
-                The number of bits for PQ (Product Quantization). Default is 8.
-                Only 4, 8 are supported.
+                The number of bits for PQ (Product Quantization) or RQ (Rabit Quantization).
+                Default is 8 for PQ and 1 for RQ.
+                PQ supports only 4, 8.
+            - rotate
+                (RQ only) Whether to apply a random rotation matrix before RabitQ quantization.
+                Default is True. Setting this to False can reduce CPU cost (no matrix multiply),
+                but may reduce recall.
             - index_file_version
                 The version of the index file. Default is "V3".
 

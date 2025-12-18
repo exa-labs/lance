@@ -3267,6 +3267,10 @@ fn prepare_vector_index_params(
             rq_params.num_bits = num_bits;
         };
 
+        if let Some(rotate) = kwargs.get_item("rotate")? {
+            rq_params.rotate = rotate.extract()?;
+        };
+
         if let Some(n) = kwargs.get_item("num_sub_vectors")? {
             pq_params.num_sub_vectors = n.extract()?
         };

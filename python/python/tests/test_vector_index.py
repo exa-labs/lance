@@ -910,6 +910,23 @@ def test_create_ivf_hnsw_rq_index():
     assert ds.list_indices()[0]["fields"] == ["vector"]
 
 
+def test_create_ivf_hnsw_rq_index_rotate_false():
+    ds = lance.write_dataset(create_table(), "memory://")
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_HNSW_RQ",
+        num_partitions=4,
+        num_bits=1,
+        rotate=False,
+    )
+    assert ds.list_indices()[0]["fields"] == ["vector"]
+
+    # Ensure query path works (rotate should be skipped)
+    q = np.random.randn(128).astype(np.float32)
+    res = ds.to_table(nearest={"column": "vector", "q": q, "k": 10})
+    assert res.num_rows == 10
+
+
 def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
     query = np.random.rand(5, 128)
     results = indexed_multivec_dataset.scanner(
