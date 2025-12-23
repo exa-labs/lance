@@ -4,15 +4,10 @@
 import argparse
 import inspect
 import json
+import resource
+import sys
 import time
 from typing import Any, Dict, Optional
-
-try:
-    import lancedb
-except ImportError as exc:  # pragma: no cover - only used when lancedb missing
-    raise SystemExit(
-        "lancedb is required for this script. Install with 'pip install lancedb'."
-    ) from exc
 
 
 def _filter_kwargs(fn: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
@@ -21,6 +16,23 @@ def _filter_kwargs(fn: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     except (TypeError, ValueError):
         return kwargs
     return {k: v for k, v in kwargs.items() if k in sig.parameters}
+
+
+def human_bytes(num_bytes: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    size = float(num_bytes)
+    for unit in units:
+        if size < 1024.0 or unit == units[-1]:
+            return f"{size:.2f} {unit}"
+        size /= 1024.0
+    return f"{size:.2f} PB"
+
+
+def read_peak_rss_bytes() -> int:
+    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return int(usage)
+    return int(usage * 1024)
 
 
 def create_fts_index(
@@ -66,6 +78,13 @@ def create_fts_index(
 
 
 def main() -> None:
+    try:
+        import lancedb
+    except ImportError as exc:  # pragma: no cover - only used when lancedb missing
+        raise SystemExit(
+            "lancedb is required for this script. Install with 'pip install lancedb'."
+        ) from exc
+
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
@@ -89,6 +108,7 @@ def main() -> None:
     else:
         table = db.table(args.table)
 
+    peak_before = read_peak_rss_bytes()
     start = time.perf_counter()
     create_fts_index(
         table,
@@ -99,6 +119,8 @@ def main() -> None:
         with_position=args.with_position,
     )
     duration = time.perf_counter() - start
+    peak_after = read_peak_rss_bytes()
+    peak_delta = max(peak_after - peak_before, 0)
 
     result = {
         "table": args.table,
@@ -108,6 +130,10 @@ def main() -> None:
         "tokenizer": args.tokenizer,
         "with_position": args.with_position,
         "duration_s": duration,
+        "peak_rss_bytes": peak_after,
+        "peak_rss_human": human_bytes(peak_after),
+        "peak_rss_delta_bytes": peak_delta,
+        "peak_rss_delta_human": human_bytes(peak_delta),
     }
     print(json.dumps(result, indent=2))
 

@@ -2,19 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import itertools
+import math
 import random
 import time
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
-
-import pyarrow as pa
-
-try:
-    import lancedb
-except ImportError as exc:  # pragma: no cover - only used when lancedb missing
-    raise SystemExit(
-        "lancedb is required for this script. Install with 'pip install lancedb'."
-    ) from exc
 
 SYSTEM_WORD_LISTS = (
     "/usr/share/dict/words",
@@ -98,14 +91,51 @@ def resolve_words(
     return tuple(words)
 
 
+def build_cum_weights(
+    distribution: str,
+    vocab_size: int,
+    normal_mean: float,
+    normal_stddev: float,
+) -> Optional[List[float]]:
+    if distribution == "uniform":
+        return None
+    if distribution != "normal":
+        raise ValueError(f"Unsupported distribution: {distribution}")
+    if not (0.0 <= normal_mean <= 1.0):
+        raise ValueError("normal_mean must be between 0 and 1")
+    if not (0.0 < normal_stddev <= 1.0):
+        raise ValueError("normal_stddev must be in (0, 1]")
+
+    mu = normal_mean * (vocab_size - 1)
+    sigma = max(normal_stddev * vocab_size, 1e-6)
+    weights = [
+        math.exp(-0.5 * ((idx - mu) / sigma) ** 2) for idx in range(vocab_size)
+    ]
+    if not any(weight > 0 for weight in weights):
+        raise ValueError("Normal distribution produced zero weights")
+    return list(itertools.accumulate(weights))
+
+
+def sample_words(
+    rng: random.Random,
+    vocab: Sequence[str],
+    cum_weights: Optional[Sequence[float]],
+    words_per_doc: int,
+) -> List[str]:
+    if cum_weights is None:
+        return rng.choices(vocab, k=words_per_doc)
+    return rng.choices(vocab, cum_weights=cum_weights, k=words_per_doc)
+
+
 def iter_docs(
     rows: int,
     words_per_doc: int,
     vocab: Sequence[str],
+    cum_weights: Optional[Sequence[float]],
     rng: random.Random,
 ) -> Iterable[str]:
     for _ in range(rows):
-        yield " ".join(rng.choices(vocab, k=words_per_doc))
+        yield " ".join(sample_words(rng, vocab, cum_weights, words_per_doc))
 
 
 def write_batches(
@@ -114,6 +144,7 @@ def write_batches(
     total_rows: int,
     words_per_doc: int,
     vocab: Sequence[str],
+    cum_weights: Optional[Sequence[float]],
     batch_rows: int,
     seed: int,
     mode: str,
@@ -121,6 +152,19 @@ def write_batches(
     start_id: int,
     log_every: int,
 ) -> None:
+    try:
+        import lancedb
+    except ImportError as exc:  # pragma: no cover - only used when lancedb missing
+        raise SystemExit(
+            "lancedb is required for this script. Install with 'pip install lancedb'."
+        ) from exc
+    try:
+        import pyarrow as pa
+    except ImportError as exc:  # pragma: no cover - only used when pyarrow missing
+        raise SystemExit(
+            "pyarrow is required for this script. Install with 'pip install pyarrow'."
+        ) from exc
+
     rng = random.Random(seed)
     db = lancedb.connect(db_uri)
 
@@ -132,7 +176,7 @@ def write_batches(
 
     while rows_written < total_rows:
         batch_size = min(batch_rows, total_rows - rows_written)
-        docs = list(iter_docs(batch_size, words_per_doc, vocab, rng))
+        docs = list(iter_docs(batch_size, words_per_doc, vocab, cum_weights, rng))
         arrays = {"doc": pa.array(docs, type=pa.large_string())}
         if with_id:
             ids = range(next_id, next_id + batch_size)
@@ -190,6 +234,24 @@ def main() -> None:
     parser.add_argument("--word-list", type=str, default=None)
     parser.add_argument("--min-word-len", type=int, default=2)
     parser.add_argument("--max-word-len", type=int, default=24)
+    parser.add_argument(
+        "--distribution",
+        choices=["normal", "uniform"],
+        default="normal",
+        help="Distribution used to sample words",
+    )
+    parser.add_argument(
+        "--normal-mean",
+        type=float,
+        default=0.5,
+        help="Mean for normal distribution as fraction of vocab (0-1)",
+    )
+    parser.add_argument(
+        "--normal-stddev",
+        type=float,
+        default=0.15,
+        help="Stddev for normal distribution as fraction of vocab (0-1]",
+    )
     parser.add_argument("--mode", choices=["overwrite", "append"], default="overwrite")
     parser.add_argument("--with-id", action="store_true", default=False)
     parser.add_argument("--start-id", type=int, default=0)
@@ -215,8 +277,16 @@ def main() -> None:
     )
     print(
         f"vocab size: {len(vocab):,}, batch size: {args.batch_rows:,}, "
-        f"mode: {args.mode}"
+        f"mode: {args.mode}, distribution: {args.distribution}"
     )
+    cum_weights = build_cum_weights(
+        args.distribution, len(vocab), args.normal_mean, args.normal_stddev
+    )
+    if cum_weights is not None:
+        print(
+            f"normal mean: {args.normal_mean:.3f}, "
+            f"normal stddev: {args.normal_stddev:.3f}"
+        )
 
     write_batches(
         db_uri=args.db_uri,
@@ -224,6 +294,7 @@ def main() -> None:
         total_rows=args.rows,
         words_per_doc=args.words_per_doc,
         vocab=vocab,
+        cum_weights=cum_weights,
         batch_rows=args.batch_rows,
         seed=args.seed,
         mode=args.mode,
