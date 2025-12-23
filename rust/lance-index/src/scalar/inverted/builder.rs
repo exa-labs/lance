@@ -486,11 +486,10 @@ impl InnerBuilder {
                 );
             }
         }
-        if !buffer.is_empty() {
-            let batch = concat_batches(&schema, buffer.iter())?;
+
+        for batch in buffer {
             writer.write_record_batch(batch).await?;
         }
-
         writer.finish().await?;
         Ok(())
     }
