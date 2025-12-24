@@ -4,6 +4,7 @@
 use std::fmt::{Debug, Display};
 use std::convert::Infallible;
 use std::sync::{Arc, LazyLock, OnceLock, Weak};
+use std::time::Duration;
 use std::{
     cmp::{min, Reverse},
     collections::BinaryHeap,
@@ -1766,7 +1767,9 @@ struct DecompressedBlockCache {
 impl Default for DecompressedBlockCache {
     fn default() -> Self {
         Self {
-            blocks: Cache::builder().build(),
+            blocks: Cache::builder()
+                .time_to_idle(Duration::from_secs(1))
+                .build(),
         }
     }
 }
