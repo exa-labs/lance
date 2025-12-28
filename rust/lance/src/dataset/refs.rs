@@ -280,6 +280,13 @@ impl Tags<'_> {
                 message: format!("tag {} already exists", tag),
             });
         }
+
+        let branch_file = branch_contents_path(&root_location.path, tag);
+        if self.object_store().exists(&branch_file).await? {
+            return Err(Error::RefConflict {
+                message: format!("tag {} conflicts with existing branch", tag),
+            });
+        }
         let tag_contents = self.build_tag_content_by_ref(reference).await?;
 
         self.object_store()
@@ -314,6 +321,13 @@ impl Tags<'_> {
         if !self.object_store().exists(&tag_file).await? {
             return Err(Error::RefNotFound {
                 message: format!("tag {} does not exist", tag),
+            });
+        }
+
+        let branch_file = branch_contents_path(&root_location.path, tag);
+        if self.object_store().exists(&branch_file).await? {
+            return Err(Error::RefConflict {
+                message: format!("tag {} conflicts with existing branch", tag),
             });
         }
         let tag_contents = self.build_tag_content_by_ref(reference).await?;
@@ -452,6 +466,13 @@ impl Branches<'_> {
 
         let source_branch = source_branch.and_then(standardize_branch);
         let root_location = self.refs.root()?;
+
+        let tag_file = tag_path(&root_location.path, branch_name);
+        if self.object_store().exists(&tag_file).await? {
+            return Err(Error::RefConflict {
+                message: format!("branch {} conflicts with existing tag", branch_name),
+            });
+        }
         let branch_file = branch_contents_path(&root_location.path, branch_name);
         if self.object_store().exists(&branch_file).await? {
             return Err(Error::RefConflict {

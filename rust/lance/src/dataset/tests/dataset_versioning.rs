@@ -366,6 +366,59 @@ async fn test_tag(
     assert_eq!(dataset.manifest.version, 1);
 }
 
+#[tokio::test]
+async fn test_tag_branch_name_conflict() {
+    let test_uri = TempStrDir::default();
+
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::UInt32,
+        false,
+    )]));
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from_iter_values(0..10))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+
+    dataset
+        .create_branch("conflict", dataset.version().version, None)
+        .await
+        .unwrap();
+
+    let err = dataset
+        .tags()
+        .create("conflict", dataset.version().version)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        err,
+        "Ref conflict error: tag conflict conflicts with existing branch"
+    );
+
+    dataset
+        .tags()
+        .create("tag_conflict", dataset.version().version)
+        .await
+        .unwrap();
+
+    let err = dataset
+        .create_branch("tag_conflict", dataset.version().version, None)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        err,
+        "Ref conflict error: branch tag_conflict conflicts with existing tag"
+    );
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_fragment_id_zero_not_reused() {
