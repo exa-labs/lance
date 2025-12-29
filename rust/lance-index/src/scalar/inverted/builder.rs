@@ -799,6 +799,15 @@ pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
         ),
         arrow_schema::Field::new(MAX_SCORE_COL, datatypes::DataType::Float32, false),
         arrow_schema::Field::new(LENGTH_COL, datatypes::DataType::UInt32, false),
+        arrow_schema::Field::new(
+            BLOCK_MAX_SCORE_COL,
+            datatypes::DataType::List(Arc::new(Field::new(
+                "item",
+                datatypes::DataType::Float32,
+                true,
+            ))),
+            false,
+        ),
     ];
     if with_position {
         fields.push(arrow_schema::Field::new(

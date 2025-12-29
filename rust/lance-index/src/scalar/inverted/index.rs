@@ -7,7 +7,7 @@ use std::{
     cmp::{min, Reverse},
     collections::BinaryHeap,
 };
-use std::{collections::HashMap, ops::Range};
+use std::{collections::HashMap, collections::HashSet, ops::Range};
 
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
@@ -100,6 +100,8 @@ pub const POSTING_COL: &str = "_posting";
 pub const MAX_SCORE_COL: &str = "_max_score";
 pub const LENGTH_COL: &str = "_length";
 pub const BLOCK_MAX_SCORE_COL: &str = "_block_max_score";
+pub const PREFETCH_PREFIX_NUM: usize = 16;
+pub const PREFETCH_TOP_NUM: usize = 32;
 pub const NUM_TOKEN_COL: &str = "_num_tokens";
 pub const SCORE_COL: &str = "_score";
 pub const TOKEN_SET_FORMAT_KEY: &str = "token_set_format";
@@ -795,13 +797,21 @@ impl InvertedPartition {
             token_ids.dedup_by_key(|(token_id, _)| *token_id);
         }
 
-        let prefetched = if !self.is_legacy() {
-            let mut requests = Vec::with_capacity(token_ids.len());
-            for (token_id, _) in &token_ids {
-                if let Some(request) = self.inverted_list.block_request(*token_id, 0)? {
-                    requests.push(request);
-                }
-            }
+        let prefetched = if !self.is_legacy() && (PREFETCH_PREFIX_NUM > 0 || PREFETCH_TOP_NUM > 0) {
+            let inverted_list = self.inverted_list.clone();
+            let token_ids = token_ids
+                .iter()
+                .map(|(token_id, _)| *token_id)
+                .collect::<Vec<_>>();
+            let requests = stream::iter(token_ids)
+                .map(move |token_id| {
+                    let inverted_list = inverted_list.clone();
+                    async move { inverted_list.prefetch_requests_for_token(token_id).await }
+                })
+                .buffered(self.store.io_parallelism())
+                .try_collect::<Vec<_>>()
+                .await?;
+            let requests = requests.into_iter().flatten().collect::<Vec<_>>();
             self.inverted_list
                 .prefetch_blocks(&requests, metrics.as_ref())
                 .await?
@@ -1237,6 +1247,7 @@ pub struct PostingListReader {
     lengths: Option<Vec<u32>>,
 
     has_position: bool,
+    has_block_max_scores: bool,
 
     index_cache: WeakLanceCache,
     block_loader: Arc<PostingBlockLoader>,
@@ -1266,6 +1277,7 @@ impl PostingListReader {
         io_parallelism: usize,
     ) -> Result<Self> {
         let has_position = reader.schema().field(POSITION_COL).is_some();
+        let has_block_max_scores = reader.schema().field(BLOCK_MAX_SCORE_COL).is_some();
         let (offsets, max_scores, lengths) = if reader.schema().field(POSTING_COL).is_none() {
             let (offsets, max_scores) = Self::load_metadata(reader.schema())?;
             (Some(offsets), max_scores, None)
@@ -1296,6 +1308,7 @@ impl PostingListReader {
             max_scores,
             lengths,
             has_position,
+            has_block_max_scores,
             index_cache: WeakLanceCache::from(index_cache),
             block_loader,
         })
@@ -1491,6 +1504,91 @@ impl PostingListReader {
         self.block_loader.load_blocks(requests, metrics).await
     }
 
+    async fn block_max_scores(&self, token_id: u32) -> Result<Option<Arc<Vec<f32>>>> {
+        if self.offsets.is_some() || !self.has_block_max_scores {
+            return Ok(None);
+        }
+
+        let cache_key = BlockMaxScoreKey { token_id };
+        let scores = self
+            .index_cache
+            .get_or_insert_with_key(cache_key, || async move {
+                let batch = self
+                    .reader
+                    .read_range(
+                        token_id as usize..token_id as usize + 1,
+                        Some(&[BLOCK_MAX_SCORE_COL]),
+                    )
+                    .await?;
+                let list = batch[BLOCK_MAX_SCORE_COL].as_list::<i32>();
+                if list.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let values = list.value(0);
+                let values = values.as_primitive::<Float32Type>();
+                Ok(values.values().to_vec())
+            })
+            .await?;
+
+        if let Some(lengths) = &self.lengths {
+            let length = *lengths.get(token_id as usize).ok_or(Error::Internal {
+                message: "token id out of bounds for lengths".to_string(),
+                location: location!(),
+            })?;
+            let expected_blocks = (length as usize).div_ceil(BLOCK_SIZE);
+            if scores.len() != expected_blocks {
+                return Err(Error::Internal {
+                    message: format!(
+                        "block max scores length {} does not match expected {} for token {}",
+                        scores.len(),
+                        expected_blocks,
+                        token_id
+                    ),
+                    location: location!(),
+                });
+            }
+        }
+
+        Ok(Some(scores))
+    }
+
+    async fn prefetch_requests_for_token(&self, token_id: u32) -> Result<Vec<BlockRequest>> {
+        if self.offsets.is_some() {
+            return Ok(Vec::new());
+        }
+
+        let mut requests = Vec::new();
+        let mut selected = HashSet::new();
+
+        if PREFETCH_PREFIX_NUM > 0 {
+            for block_idx in 0..PREFETCH_PREFIX_NUM {
+                if let Some(request) = self.block_request(token_id, block_idx)? {
+                    if selected.insert(block_idx) {
+                        requests.push(request);
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if PREFETCH_TOP_NUM > 0 {
+            if let Some(scores) = self.block_max_scores(token_id).await? {
+                let mut ranked = scores.iter().copied().enumerate().collect::<Vec<_>>();
+                ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+                for (block_idx, _) in ranked.into_iter().take(PREFETCH_TOP_NUM) {
+                    if selected.insert(block_idx) {
+                        if let Some(request) = self.block_request(token_id, block_idx)? {
+                            requests.push(request);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(requests)
+    }
+
     pub(crate) fn posting_list_from_batch(
         &self,
         batch: &RecordBatch,
@@ -1673,6 +1771,19 @@ impl CacheKey for PostingBlockKey {
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("postings-{}-block-{}", self.token_id, self.block_idx).into()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BlockMaxScoreKey {
+    pub token_id: u32,
+}
+
+impl CacheKey for BlockMaxScoreKey {
+    type ValueType = Vec<f32>;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("postings-{}-block-max-scores", self.token_id).into()
     }
 }
 
@@ -2366,7 +2477,17 @@ impl PostingListBuilder {
             self.doc_ids.len(),
             self.doc_ids.iter(),
             self.frequencies.iter(),
-            block_max_scores.into_iter(),
+            block_max_scores.iter().copied(),
+        )?;
+        let block_score_offsets =
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, block_max_scores.len() as i32]));
+        let block_scores = ListArray::try_new(
+            Arc::new(Field::new("item", datatypes::DataType::Float32, true)),
+            block_score_offsets,
+            Arc::new(Float32Array::from_iter_values(
+                block_max_scores.iter().copied(),
+            )),
+            None,
         )?;
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, compressed.len() as i32]));
         let mut columns = vec![
@@ -2380,6 +2501,7 @@ impl PostingListBuilder {
             Arc::new(UInt32Array::from_iter_values(std::iter::once(
                 self.len() as u32
             ))) as ArrayRef,
+            Arc::new(block_scores) as ArrayRef,
         ];
 
         if let Some(positions) = self.positions.as_ref() {
@@ -3159,6 +3281,66 @@ mod tests {
             .unwrap();
         let stats = cache.stats().await;
         assert_eq!(stats.num_entries, 1);
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_requests_prefix_and_top_blocks() {
+        let tmpdir = TempObjDir::default();
+        let cache = Arc::new(LanceCache::with_capacity(1024 * 1024));
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            cache.clone(),
+        ));
+
+        let num_blocks = PREFETCH_PREFIX_NUM + PREFETCH_TOP_NUM + 16;
+        let num_docs = BLOCK_SIZE * num_blocks;
+        let mut posting_list = PostingListBuilder::new(false);
+        for doc_id in 0..num_docs {
+            posting_list.add(doc_id as u32, PositionRecorder::Count(1));
+        }
+
+        let mut block_max_scores = Vec::with_capacity(num_blocks);
+        let top_start = num_blocks - PREFETCH_TOP_NUM;
+        for block_idx in 0..num_blocks {
+            let score = if block_idx < top_start {
+                1.0
+            } else {
+                1000.0 + block_idx as f32
+            };
+            block_max_scores.push(score);
+        }
+
+        let batch = posting_list.to_batch(block_max_scores).unwrap();
+        let mut writer = store
+            .new_index_file(&posting_file_path(0), inverted_list_schema(false))
+            .await
+            .unwrap();
+        writer.write_record_batch(batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let reader = store.open_index_file(&posting_file_path(0)).await.unwrap();
+        let posting_reader =
+            PostingListReader::try_new(reader, cache.as_ref(), store.io_parallelism())
+                .await
+                .unwrap();
+
+        let requests = posting_reader.prefetch_requests_for_token(0).await.unwrap();
+        let requested = requests
+            .iter()
+            .map(|request| request.block_idx)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(requested.len(), PREFETCH_PREFIX_NUM + PREFETCH_TOP_NUM);
+        for idx in 0..PREFETCH_PREFIX_NUM {
+            assert!(requested.contains(&idx));
+        }
+        for idx in top_start..num_blocks {
+            assert!(requested.contains(&idx));
+        }
+        let middle_idx = PREFETCH_PREFIX_NUM + 1;
+        assert!(middle_idx < top_start);
+        assert!(!requested.contains(&middle_idx));
     }
 
     #[tokio::test]
