@@ -1565,11 +1565,13 @@ mod tests {
     #[test]
     fn test_alp_field_metadata_v2_2() {
         let params = CompressionParams::new();
-        let strategy = DefaultCompressionStrategy::with_params(params).with_version(LanceFileVersion::V2_2);
+        let strategy =
+            DefaultCompressionStrategy::with_params(params).with_version(LanceFileVersion::V2_2);
 
         let mut metadata = HashMap::new();
         metadata.insert(ALP_META_KEY.to_string(), "on".to_string());
-        let arrow_field = ArrowField::new("price", DataType::Float32, false).with_metadata(metadata);
+        let arrow_field =
+            ArrowField::new("price", DataType::Float32, false).with_metadata(metadata);
         let field = Field::try_from(&arrow_field).unwrap();
 
         let data = create_fixed_width_block(32, 100);
@@ -1580,11 +1582,13 @@ mod tests {
     #[test]
     fn test_alp_ignored_before_v2_2() {
         let params = CompressionParams::new();
-        let strategy = DefaultCompressionStrategy::with_params(params).with_version(LanceFileVersion::V2_1);
+        let strategy =
+            DefaultCompressionStrategy::with_params(params).with_version(LanceFileVersion::V2_1);
 
         let mut metadata = HashMap::new();
         metadata.insert(ALP_META_KEY.to_string(), "on".to_string());
-        let arrow_field = ArrowField::new("price", DataType::Float32, false).with_metadata(metadata);
+        let arrow_field =
+            ArrowField::new("price", DataType::Float32, false).with_metadata(metadata);
         let field = Field::try_from(&arrow_field).unwrap();
 
         let data = create_fixed_width_block(32, 100);

@@ -131,10 +131,7 @@ fn sample_positions(num_values: usize, sample_size: usize) -> Vec<usize> {
 /// stable and fast while tracking the same storage layout used by actual chunk encoding.
 fn find_best_exponents_f32(values: &[f32]) -> Exponents {
     let positions = sample_positions(values.len(), 32);
-    let sample = positions
-        .into_iter()
-        .map(|i| values[i])
-        .collect::<Vec<_>>();
+    let sample = positions.into_iter().map(|i| values[i]).collect::<Vec<_>>();
 
     let mut best = Exponents { e: 0, f: 0 };
     let mut best_bytes = usize::MAX;
@@ -157,10 +154,7 @@ fn find_best_exponents_f32(values: &[f32]) -> Exponents {
 /// Same strategy as [`find_best_exponents_f32`], but with the `f64` exponent range (`e <= 18`).
 fn find_best_exponents_f64(values: &[f64]) -> Exponents {
     let positions = sample_positions(values.len(), 32);
-    let sample = positions
-        .into_iter()
-        .map(|i| values[i])
-        .collect::<Vec<_>>();
+    let sample = positions.into_iter().map(|i| values[i]).collect::<Vec<_>>();
 
     let mut best = Exponents { e: 0, f: 0 };
     let mut best_bytes = usize::MAX;
@@ -493,28 +487,29 @@ impl MiniBlockCompressor for AlpMiniBlockEncoder {
                     let chunk_bytes_len = chunk_values * bytes_per_value;
                     let chunk_bytes = &bytes[offset..offset + chunk_bytes_len];
 
-                    let words =
-                        bytemuck::try_cast_slice::<u8, u32>(chunk_bytes).map_err(|_| {
-                            Error::invalid_input("invalid f32 buffer alignment", location!())
-                        })?;
+                    let words = bytemuck::try_cast_slice::<u8, u32>(chunk_bytes).map_err(|_| {
+                        Error::invalid_input("invalid f32 buffer alignment", location!())
+                    })?;
                     let floats = words.iter().map(|b| f32::from_bits(*b)).collect::<Vec<_>>();
-                    let encoded = match encode_chunk_f32(&floats, exponents) {
-                        Ok(v) => v,
-                        Err(_) => return ValueEncoder::default().compress(DataBlock::FixedWidth(data)),
+                    let Ok(encoded) = encode_chunk_f32(&floats, exponents) else {
+                        return ValueEncoder::default().compress(DataBlock::FixedWidth(data));
                     };
 
                     let delta_bytes = encoded
                         .packed_deltas
                         .len()
                         .checked_mul(std::mem::size_of::<u32>())
-                        .ok_or_else(|| Error::invalid_input("ALP chunk size overflow", location!()))?
-                        as u32;
+                        .ok_or_else(|| {
+                            Error::invalid_input("ALP chunk size overflow", location!())
+                        })? as u32;
                     let header_bytes = encoded.header.len() as u32;
                     let pos_bytes = (encoded.exception_positions.len() * 2) as u32;
                     let exc_bytes = encoded.exception_bits.len() as u32;
 
-                    let total_value_bytes =
-                        delta_bytes as u64 + header_bytes as u64 + pos_bytes as u64 + exc_bytes as u64;
+                    let total_value_bytes = delta_bytes as u64
+                        + header_bytes as u64
+                        + pos_bytes as u64
+                        + exc_bytes as u64;
                     if total_value_bytes > MAX_MINIBLOCK_BYTES {
                         return ValueEncoder::default().compress(DataBlock::FixedWidth(data));
                     }
@@ -539,10 +534,8 @@ impl MiniBlockCompressor for AlpMiniBlockEncoder {
                     offset += chunk_bytes_len;
                 }
 
-                let compressed_size = buf0.len() * std::mem::size_of::<u32>()
-                    + buf1.len()
-                    + buf2.len()
-                    + buf3.len();
+                let compressed_size =
+                    buf0.len() * std::mem::size_of::<u32>() + buf1.len() + buf2.len() + buf3.len();
                 if compressed_size >= raw_size {
                     return ValueEncoder::default().compress(DataBlock::FixedWidth(data));
                 }
@@ -589,28 +582,29 @@ impl MiniBlockCompressor for AlpMiniBlockEncoder {
                     let chunk_bytes_len = chunk_values * bytes_per_value;
                     let chunk_bytes = &bytes[offset..offset + chunk_bytes_len];
 
-                    let words =
-                        bytemuck::try_cast_slice::<u8, u64>(chunk_bytes).map_err(|_| {
-                            Error::invalid_input("invalid f64 buffer alignment", location!())
-                        })?;
+                    let words = bytemuck::try_cast_slice::<u8, u64>(chunk_bytes).map_err(|_| {
+                        Error::invalid_input("invalid f64 buffer alignment", location!())
+                    })?;
                     let floats = words.iter().map(|b| f64::from_bits(*b)).collect::<Vec<_>>();
-                    let encoded = match encode_chunk_f64(&floats, exponents) {
-                        Ok(v) => v,
-                        Err(_) => return ValueEncoder::default().compress(DataBlock::FixedWidth(data)),
+                    let Ok(encoded) = encode_chunk_f64(&floats, exponents) else {
+                        return ValueEncoder::default().compress(DataBlock::FixedWidth(data));
                     };
 
                     let delta_bytes = encoded
                         .packed_deltas
                         .len()
                         .checked_mul(std::mem::size_of::<u64>())
-                        .ok_or_else(|| Error::invalid_input("ALP chunk size overflow", location!()))?
-                        as u32;
+                        .ok_or_else(|| {
+                            Error::invalid_input("ALP chunk size overflow", location!())
+                        })? as u32;
                     let header_bytes = encoded.header.len() as u32;
                     let pos_bytes = (encoded.exception_positions.len() * 2) as u32;
                     let exc_bytes = encoded.exception_bits.len() as u32;
 
-                    let total_value_bytes =
-                        delta_bytes as u64 + header_bytes as u64 + pos_bytes as u64 + exc_bytes as u64;
+                    let total_value_bytes = delta_bytes as u64
+                        + header_bytes as u64
+                        + pos_bytes as u64
+                        + exc_bytes as u64;
                     if total_value_bytes > MAX_MINIBLOCK_BYTES {
                         return ValueEncoder::default().compress(DataBlock::FixedWidth(data));
                     }
@@ -635,10 +629,8 @@ impl MiniBlockCompressor for AlpMiniBlockEncoder {
                     offset += chunk_bytes_len;
                 }
 
-                let compressed_size = buf0.len() * std::mem::size_of::<u64>()
-                    + buf1.len()
-                    + buf2.len()
-                    + buf3.len();
+                let compressed_size =
+                    buf0.len() * std::mem::size_of::<u64>() + buf1.len() + buf2.len() + buf3.len();
                 if compressed_size >= raw_size {
                     return ValueEncoder::default().compress(DataBlock::FixedWidth(data));
                 }
@@ -870,7 +862,10 @@ impl AlpMiniBlockDecompressor {
     pub fn from_description(desc: &pb21::Alp) -> Result<Self> {
         let bits_per_value = desc.bits_per_value as u64;
         if bits_per_value != 32 && bits_per_value != 64 {
-            return Err(Error::invalid_input("ALP bits_per_value must be 32 or 64", location!()));
+            return Err(Error::invalid_input(
+                "ALP bits_per_value must be 32 or 64",
+                location!(),
+            ));
         }
         let exp = Exponents {
             e: desc.exponent_e as u8,
@@ -878,18 +873,27 @@ impl AlpMiniBlockDecompressor {
         };
 
         if exp.f >= exp.e {
-            return Err(Error::invalid_input("ALP requires exponent_f < exponent_e", location!()));
+            return Err(Error::invalid_input(
+                "ALP requires exponent_f < exponent_e",
+                location!(),
+            ));
         }
 
         match bits_per_value {
             32 => {
                 if exp.e as usize >= F10_F32.len() || exp.f as usize >= F10_F32.len() {
-                    return Err(Error::invalid_input("ALP f32 exponents out of range", location!()));
+                    return Err(Error::invalid_input(
+                        "ALP f32 exponents out of range",
+                        location!(),
+                    ));
                 }
             }
             64 => {
                 if exp.e as usize >= F10_F64.len() || exp.f as usize >= F10_F64.len() {
-                    return Err(Error::invalid_input("ALP f64 exponents out of range", location!()));
+                    return Err(Error::invalid_input(
+                        "ALP f64 exponents out of range",
+                        location!(),
+                    ));
                 }
             }
             _ => unreachable!(),
@@ -921,9 +925,8 @@ impl MiniBlockDecompressor for AlpMiniBlockDecompressor {
             ));
         }
 
-        let n = usize::try_from(num_values).map_err(|_| {
-            Error::invalid_input("ALP chunk too large for usize", location!())
-        })?;
+        let n = usize::try_from(num_values)
+            .map_err(|_| Error::invalid_input("ALP chunk too large for usize", location!()))?;
 
         let mut iter = data.into_iter();
         let packed_deltas = iter.next().unwrap();
@@ -935,7 +938,10 @@ impl MiniBlockDecompressor for AlpMiniBlockDecompressor {
         let (min, bit_width) = match self.bits_per_value {
             32 => {
                 if header_bytes.len() != 5 {
-                    return Err(Error::invalid_input("ALP header buffer size mismatch", location!()));
+                    return Err(Error::invalid_input(
+                        "ALP header buffer size mismatch",
+                        location!(),
+                    ));
                 }
                 let min = i32::from_le_bytes([
                     header_bytes[0],
@@ -945,13 +951,19 @@ impl MiniBlockDecompressor for AlpMiniBlockDecompressor {
                 ]) as i64;
                 let bit_width = header_bytes[4];
                 if bit_width > 32 {
-                    return Err(Error::invalid_input("ALP bit width out of range for f32", location!()));
+                    return Err(Error::invalid_input(
+                        "ALP bit width out of range for f32",
+                        location!(),
+                    ));
                 }
                 (min, bit_width)
             }
             64 => {
                 if header_bytes.len() != 9 {
-                    return Err(Error::invalid_input("ALP header buffer size mismatch", location!()));
+                    return Err(Error::invalid_input(
+                        "ALP header buffer size mismatch",
+                        location!(),
+                    ));
                 }
                 let min = i64::from_le_bytes([
                     header_bytes[0],
@@ -965,7 +977,10 @@ impl MiniBlockDecompressor for AlpMiniBlockDecompressor {
                 ]);
                 let bit_width = header_bytes[8];
                 if bit_width > 64 {
-                    return Err(Error::invalid_input("ALP bit width out of range for f64", location!()));
+                    return Err(Error::invalid_input(
+                        "ALP bit width out of range for f64",
+                        location!(),
+                    ));
                 }
                 (min, bit_width)
             }
@@ -1013,7 +1028,10 @@ impl MiniBlockDecompressor for AlpMiniBlockDecompressor {
         let exc_bytes = exception_bits.as_ref();
 
         if pos_bytes.len() % 2 != 0 {
-            return Err(Error::invalid_input("ALP exception positions not u16-aligned", location!()));
+            return Err(Error::invalid_input(
+                "ALP exception positions not u16-aligned",
+                location!(),
+            ));
         }
         let exception_count = pos_bytes.len() / 2;
         let value_bytes = (self.bits_per_value / 8) as usize;
@@ -1027,7 +1045,10 @@ impl MiniBlockDecompressor for AlpMiniBlockDecompressor {
         for i in 0..exception_count {
             let pos = u16::from_le_bytes([pos_bytes[i * 2], pos_bytes[i * 2 + 1]]) as usize;
             if pos >= n {
-                return Err(Error::invalid_input("ALP exception position out of range", location!()));
+                return Err(Error::invalid_input(
+                    "ALP exception position out of range",
+                    location!(),
+                ));
             }
             let start = i * value_bytes;
             let end = start + value_bytes;
@@ -1060,7 +1081,10 @@ mod tests {
     use crate::statistics::ComputeStat;
 
     fn round_trip_f32(values: &[f32]) {
-        let bytes = values.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect::<Vec<_>>();
+        let bytes = values
+            .iter()
+            .flat_map(|v| v.to_bits().to_le_bytes())
+            .collect::<Vec<_>>();
         let mut block = FixedWidthDataBlock {
             data: LanceBuffer::from(bytes),
             bits_per_value: 32,
@@ -1070,7 +1094,8 @@ mod tests {
         block.compute_stat();
         let encoder = AlpMiniBlockEncoder::new(32);
         let (compressed, encoding) = encoder.compress(DataBlock::FixedWidth(block)).unwrap();
-        let pb21::compressive_encoding::Compression::Alp(desc) = encoding.compression.unwrap() else {
+        let pb21::compressive_encoding::Compression::Alp(desc) = encoding.compression.unwrap()
+        else {
             panic!("expected ALP encoding")
         };
         assert_eq!(compressed.data.len(), 4);
@@ -1095,7 +1120,9 @@ mod tests {
                 .collect::<Vec<_>>();
 
             let decoded = decompressor.decompress(buffers, chunk_vals).unwrap();
-            let DataBlock::FixedWidth(decoded) = decoded else { panic!("expected fixed width") };
+            let DataBlock::FixedWidth(decoded) = decoded else {
+                panic!("expected fixed width")
+            };
             let words = decoded.data.borrow_to_typed_slice::<u32>();
             out.extend(words.as_ref().iter().map(|b| f32::from_bits(*b)));
         }
@@ -1107,7 +1134,10 @@ mod tests {
     }
 
     fn round_trip_f64(values: &[f64]) {
-        let bytes = values.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect::<Vec<_>>();
+        let bytes = values
+            .iter()
+            .flat_map(|v| v.to_bits().to_le_bytes())
+            .collect::<Vec<_>>();
         let mut block = FixedWidthDataBlock {
             data: LanceBuffer::from(bytes),
             bits_per_value: 64,
@@ -1117,7 +1147,8 @@ mod tests {
         block.compute_stat();
         let encoder = AlpMiniBlockEncoder::new(64);
         let (compressed, encoding) = encoder.compress(DataBlock::FixedWidth(block)).unwrap();
-        let pb21::compressive_encoding::Compression::Alp(desc) = encoding.compression.unwrap() else {
+        let pb21::compressive_encoding::Compression::Alp(desc) = encoding.compression.unwrap()
+        else {
             panic!("expected ALP encoding")
         };
         assert_eq!(compressed.data.len(), 4);
@@ -1142,7 +1173,9 @@ mod tests {
                 .collect::<Vec<_>>();
 
             let decoded = decompressor.decompress(buffers, chunk_vals).unwrap();
-            let DataBlock::FixedWidth(decoded) = decoded else { panic!("expected fixed width") };
+            let DataBlock::FixedWidth(decoded) = decoded else {
+                panic!("expected fixed width")
+            };
             let words = decoded.data.borrow_to_typed_slice::<u64>();
             out.extend(words.as_ref().iter().map(|b| f64::from_bits(*b)));
         }
@@ -1174,7 +1207,10 @@ mod tests {
     #[test]
     fn test_fallback_when_not_beneficial() {
         let values = vec![-0.0f32; 1024];
-        let bytes = values.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect::<Vec<_>>();
+        let bytes = values
+            .iter()
+            .flat_map(|v| v.to_bits().to_le_bytes())
+            .collect::<Vec<_>>();
         let mut block = FixedWidthDataBlock {
             data: LanceBuffer::from(bytes),
             bits_per_value: 32,
