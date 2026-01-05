@@ -50,8 +50,8 @@ use tracing::{info, instrument};
 
 use super::{
     builder::{
-        block_file_path, doc_file_path, inverted_list_schema, posting_file_path, token_file_path,
-        ScoredDoc, BLOCK_SIZE,
+        block_file_path, doc_file_path, inverted_list_schema, is_object_store_not_found,
+        posting_file_path, token_file_path, ScoredDoc, BLOCK_SIZE,
     },
     iter::PlainPostingListIterator,
     query::*,
@@ -732,7 +732,12 @@ impl InvertedPartition {
         let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
         let block_file = match store.open_index_file(&block_file_path(id)).await {
             Ok(reader) => Some(reader),
-            Err(Error::NotFound { .. }) | Err(Error::IndexNotFound { .. }) => None,
+            Err(err)
+                if matches!(err, Error::NotFound { .. } | Error::IndexNotFound { .. })
+                    || is_object_store_not_found(&err) =>
+            {
+                None
+            }
             Err(err) => return Err(err),
         };
         let inverted_list = PostingListReader::try_new(

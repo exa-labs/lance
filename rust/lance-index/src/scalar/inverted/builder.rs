@@ -28,6 +28,7 @@ use lance_core::{error::LanceOptionExt, utils::tempfile::TempDir};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
+use object_store::Error as ObjectStoreError;
 use snafu::location;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -881,9 +882,27 @@ pub(crate) async fn copy_index_file_if_exists(
 ) -> Result<()> {
     match store.copy_index_file(name, dest_store).await {
         Ok(()) => Ok(()),
-        Err(Error::NotFound { .. }) | Err(Error::IndexNotFound { .. }) => Ok(()),
-        Err(err) => Err(err),
+        Err(err) => {
+            if matches!(err, Error::NotFound { .. } | Error::IndexNotFound { .. })
+                || is_object_store_not_found(&err)
+            {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        }
     }
+}
+
+pub(crate) fn is_object_store_not_found(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::IO { source, .. }
+            if source
+                .downcast_ref::<ObjectStoreError>()
+                .map(|os_err| matches!(os_err, ObjectStoreError::NotFound { .. }))
+                .unwrap_or(false)
+    )
 }
 
 /// Flatten the string list stream into a string stream
@@ -1270,6 +1289,7 @@ mod tests {
     use lance_core::utils::tempfile::TempDir;
     use lance_core::ROW_ID;
     use std::sync::atomic::AtomicU64;
+    use std::io::ErrorKind;
 
     fn make_doc_batch(doc: &str, row_id: u64) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -1357,5 +1377,15 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_is_object_store_not_found() {
+        let err: Error = ObjectStoreError::NotFound {
+            path: "missing".to_string(),
+            source: Box::new(std::io::Error::new(ErrorKind::NotFound, "missing")),
+        }
+        .into();
+        assert!(is_object_store_not_found(&err));
     }
 }
