@@ -343,6 +343,14 @@ mod tests {
     }
 
     #[test]
+    fn test_l2_distance_int8_scalar() {
+        let key = [-128_i8, 0, 127];
+        let target = [127_i8, 0, -128];
+        let dist = l2_distance_int_scalar(&key, &target);
+        assert_eq!(dist, 130050.0);
+    }
+
+    #[test]
     fn test_l2_distance_cases() {
         let values: Float32Array = vec![
             0.25335717, 0.24663818, 0.26330215, 0.14988247, 0.06042378, 0.21077952, 0.26687378,

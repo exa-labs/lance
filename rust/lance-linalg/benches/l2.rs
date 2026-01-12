@@ -15,7 +15,9 @@ use rand::Rng;
 use pprof::criterion::{Output, PProfProfiler};
 
 use lance_arrow::{ArrowFloatType, FloatArray};
-use lance_linalg::distance::{l2::l2, l2_distance_batch, l2_distance_uint_scalar, L2};
+use lance_linalg::distance::{
+    l2::l2, l2_distance_batch, l2_distance_int_scalar, l2_distance_uint_scalar, L2,
+};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 const DIMENSION: usize = 1024;
@@ -159,17 +161,38 @@ fn bench_uint_distance(c: &mut Criterion) {
     });
 }
 
+fn bench_int_distance(c: &mut Criterion) {
+    let mut rng = rand::rng();
+    let key = repeat_with(|| rng.random::<i8>())
+        .take(DIMENSION)
+        .collect::<Vec<_>>();
+    let target = repeat_with(|| rng.random::<i8>())
+        .take(TOTAL * DIMENSION)
+        .collect::<Vec<_>>();
+
+    c.bench_function("L2(int8, scalar)", |b| {
+        b.iter(|| {
+            black_box(
+                target
+                    .chunks_exact(DIMENSION)
+                    .map(|tgt| l2_distance_int_scalar(&key, tgt))
+                    .fold(0.0, |acc, v| acc + v),
+            );
+        });
+    });
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_distance, bench_small_distance, bench_uint_distance);
+    targets = bench_distance, bench_small_distance, bench_uint_distance, bench_int_distance);
 
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_distance, bench_small_distance, bench_uint_distance);
+    targets = bench_distance, bench_small_distance, bench_uint_distance, bench_int_distance);
 criterion_main!(benches);
