@@ -55,9 +55,9 @@ pub fn l2_distance_int_scalar(key: &[i8], target: &[i8]) -> f32 {
         .zip(target.iter())
         .map(|(&x, &y)| {
             let diff = x as i32 - y as i32;
-            (diff * diff) as u32
+            diff * diff
         })
-        .sum::<u32>() as f32
+        .sum::<i32>() as f32
 }
 
 /// Calculate the L2 distance between two vectors, using scalar operations.
