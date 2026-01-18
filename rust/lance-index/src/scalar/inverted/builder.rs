@@ -48,7 +48,7 @@ pub const BLOCK_SIZE: usize = BitPacker4x::BLOCK_LEN;
 // when the `LANCE_FTS_FLUSH_THRESHOLD` is reached, the flush will be triggered,
 // higher for better indexing performance, but more memory usage,
 // it's in 16 MiB by default
-static LANCE_FTS_FLUSH_SIZE: LazyLock<usize> = LazyLock::new(|| {
+pub(crate) static LANCE_FTS_FLUSH_SIZE: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("LANCE_FTS_FLUSH_SIZE")
         .unwrap_or_else(|_| "16".to_string())
         .parse()
@@ -537,7 +537,7 @@ impl InnerBuilder {
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn write_tokens(&mut self, store: &dyn IndexStore) -> Result<()> {
+    pub(crate) async fn write_tokens(&mut self, store: &dyn IndexStore) -> Result<()> {
         log::info!("writing tokens of partition {}", self.id);
         let tokens = std::mem::take(&mut self.tokens);
         let batch = tokens.to_batch(self.token_set_format)?;
@@ -550,7 +550,11 @@ impl InnerBuilder {
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn write_docs(&mut self, store: &dyn IndexStore, docs: Arc<DocSet>) -> Result<()> {
+    pub(crate) async fn write_docs(
+        &mut self,
+        store: &dyn IndexStore,
+        docs: Arc<DocSet>,
+    ) -> Result<()> {
         log::info!("writing docs of partition {}", self.id);
         let batch = docs.to_batch()?;
         let mut writer = store

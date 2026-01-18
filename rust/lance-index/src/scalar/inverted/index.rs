@@ -1466,6 +1466,77 @@ impl PostingListReader {
         Ok(batch)
     }
 
+    pub(crate) fn posting_lengths(&self) -> Vec<u32> {
+        if let Some(lengths) = &self.lengths {
+            return lengths.clone();
+        }
+        let offsets = self.offsets.as_ref().expect("offsets are required");
+        let mut lengths = Vec::with_capacity(offsets.len());
+        for (idx, offset) in offsets.iter().enumerate() {
+            let end = offsets
+                .get(idx + 1)
+                .copied()
+                .unwrap_or(self.reader.num_rows());
+            lengths.push((end - *offset) as u32);
+        }
+        lengths
+    }
+
+    pub(crate) async fn read_token_range(
+        &self,
+        start_token: usize,
+        end_token: usize,
+        with_position: bool,
+    ) -> Result<(RecordBatch, usize)> {
+        if self.offsets.is_some() {
+            let offsets = self.offsets.as_ref().expect("offsets are required");
+            let start_row = offsets[start_token];
+            let end_row = offsets
+                .get(end_token)
+                .copied()
+                .unwrap_or(self.reader.num_rows());
+            let columns = if with_position {
+                vec![ROW_ID, FREQUENCY_COL, POSITION_COL]
+            } else {
+                vec![ROW_ID, FREQUENCY_COL]
+            };
+            let batch = self
+                .reader
+                .read_range(start_row..end_row, Some(&columns))
+                .await?;
+            Ok((batch, start_row))
+        } else {
+            let columns = if with_position {
+                vec![POSTING_COL, POSITION_COL]
+            } else {
+                vec![POSTING_COL]
+            };
+            let batch = self
+                .reader
+                .read_range(start_token..end_token, Some(&columns))
+                .await?;
+            Ok((batch, start_token))
+        }
+    }
+
+    pub(crate) fn posting_list_from_range_batch(
+        &self,
+        batch: &RecordBatch,
+        token_id: usize,
+        start_token: usize,
+        base_row: usize,
+    ) -> Result<PostingList> {
+        if self.offsets.is_some() {
+            let range = self.posting_list_range(token_id as u32);
+            let start = range.start - base_row;
+            let len = range.end - range.start;
+            self.posting_list_from_batch(&batch.slice(start, len), token_id as u32)
+        } else {
+            let row = token_id - start_token;
+            self.posting_list_from_batch(&batch.slice(row, 1), token_id as u32)
+        }
+    }
+
     pub(crate) async fn read_all(
         &self,
         with_position: bool,
