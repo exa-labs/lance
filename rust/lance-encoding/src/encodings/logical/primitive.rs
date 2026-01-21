@@ -3866,15 +3866,6 @@ impl PrimitiveStructuralEncoder {
         })
     }
 
-    fn extract_scalar_value(array: &ArrayRef, idx: usize) -> Result<ArrayRef> {
-        use arrow_data::transform::MutableArrayData;
-
-        let data = array.to_data();
-        let mut mutable = MutableArrayData::new(vec![&data], /*use_nulls=*/ true, 1);
-        mutable.extend(0, idx, idx + 1);
-        Ok(make_array(mutable.freeze()))
-    }
-
     fn leaf_validity(
         repdef: &crate::repdef::SerializedRepDefs,
         num_values: usize,
@@ -4050,7 +4041,8 @@ impl PrimitiveStructuralEncoder {
             return Ok(None);
         }
 
-        let scalar = Self::extract_scalar_value(&arrays[scalar_arr_idx], idx_remaining)?;
+        let scalar =
+            lance_arrow::scalar::extract_scalar_value(&arrays[scalar_arr_idx], idx_remaining)?;
         if scalar.null_count() != 0 {
             return Ok(None);
         }
@@ -4067,11 +4059,13 @@ impl PrimitiveStructuralEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<EncodedPage> {
-        let inline_value = constant::try_inline_value(&scalar);
+        let inline_value = lance_arrow::scalar::try_inline_value(&scalar);
         let value_buffer = if inline_value.is_some() {
             None
         } else {
-            Some(constant::encode_scalar_value_buffer(&scalar)?)
+            Some(LanceBuffer::from(
+                lance_arrow::scalar::encode_scalar_value_buffer(&scalar)?,
+            ))
         };
 
         let description = ProtobufUtils21::constant_layout(&repdef.def_meaning, inline_value);
