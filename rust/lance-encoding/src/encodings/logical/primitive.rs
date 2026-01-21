@@ -4796,32 +4796,6 @@ impl PrimitiveStructuralEncoder {
                 let (indices_data_block, dictionary_data_block) =
                     dict::dictionary_encode(data_block);
 
-                if version.resolve() >= LanceFileVersion::V2_2
-                    && dictionary_data_block.num_values() == 1
-                {
-                    let scalar = make_array(
-                        dictionary_data_block
-                            .clone()
-                            .into_arrow(field.data_type(), /*validate=*/ true)?,
-                    );
-                    let scalar_data = scalar.to_data();
-                    let is_supported_scalar = scalar.len() == 1
-                        && scalar.null_count() == 0
-                        && scalar_data.offset() == 0
-                        && scalar_data.child_data().is_empty();
-                    if is_supported_scalar {
-                        log::debug!(
-                            "Encoding column {} with {} items ({} rows) using constant layout (single-value dictionary)",
-                            column_idx,
-                            num_values,
-                            num_rows
-                        );
-                        return Self::encode_constant_page(
-                            column_idx, scalar, repdef, row_number, num_rows,
-                        );
-                    }
-                }
-
                 Self::encode_miniblock(
                     column_idx,
                     &field,
