@@ -48,7 +48,6 @@ pub fn extract_write_params(
     data_storage_version: &JObject,
     storage_options_obj: &JObject,
     storage_options_provider_obj: &JObject, // Optional<StorageOptionsProvider>
-    s3_credentials_refresh_offset_seconds_obj: &JObject, // Optional<Long>
 ) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
 
@@ -76,26 +75,31 @@ pub fn extract_write_params(
         extract_storage_options(env, storage_options_obj)?;
 
     // Extract storage options provider if present
-    let storage_options_provider = env.get_optional(storage_options_provider_obj, |env, obj| {
-        let provider_obj = env
-            .call_method(obj, "get", "()Ljava/lang/Object;", &[])?
-            .l()?;
-        JavaStorageOptionsProvider::new(env, provider_obj)
-    })?;
+    let storage_options_provider: Option<Arc<dyn StorageOptionsProvider>> = env
+        .get_optional(storage_options_provider_obj, |env, optional_obj| {
+            let provider_obj = env
+                .call_method(optional_obj, "get", "()Ljava/lang/Object;", &[])?
+                .l()?;
+            JavaStorageOptionsProvider::new(env, provider_obj)
+        })?
+        .map(|p| Arc::new(p) as Arc<dyn StorageOptionsProvider>);
 
-    let storage_options_provider_arc: Option<Arc<dyn StorageOptionsProvider>> =
-        storage_options_provider.map(|v| Arc::new(v) as Arc<dyn StorageOptionsProvider>);
-
-    // Extract s3_credentials_refresh_offset_seconds if present
-    let s3_credentials_refresh_offset = env
-        .get_long_opt(s3_credentials_refresh_offset_seconds_obj)?
-        .map(|v| std::time::Duration::from_secs(v as u64))
-        .unwrap_or_else(|| std::time::Duration::from_secs(10));
+    // Create storage options accessor from storage_options and provider
+    let accessor = match (storage_options.is_empty(), storage_options_provider) {
+        (false, Some(provider)) => Some(Arc::new(
+            lance::io::StorageOptionsAccessor::with_initial_and_provider(storage_options, provider),
+        )),
+        (false, None) => Some(Arc::new(
+            lance::io::StorageOptionsAccessor::with_static_options(storage_options),
+        )),
+        (true, Some(provider)) => Some(Arc::new(lance::io::StorageOptionsAccessor::with_provider(
+            provider,
+        ))),
+        (true, None) => None,
+    };
 
     write_params.store_params = Some(ObjectStoreParams {
-        storage_options: Some(storage_options),
-        storage_options_provider: storage_options_provider_arc,
-        s3_credentials_refresh_offset,
+        storage_options_accessor: accessor,
         ..Default::default()
     });
     Ok(write_params)

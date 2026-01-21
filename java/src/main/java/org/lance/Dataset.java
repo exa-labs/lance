@@ -139,8 +139,7 @@ public class Dataset implements Closeable {
               params.getMode(),
               params.getEnableStableRowIds(),
               params.getDataStorageVersion(),
-              params.getStorageOptions(),
-              params.getS3CredentialsRefreshOffsetSeconds());
+              params.getStorageOptions());
       dataset.allocator = allocator;
       return dataset;
     }
@@ -198,8 +197,7 @@ public class Dataset implements Closeable {
             params.getEnableStableRowIds(),
             params.getDataStorageVersion(),
             params.getStorageOptions(),
-            Optional.ofNullable(storageOptionsProvider),
-            params.getS3CredentialsRefreshOffsetSeconds());
+            Optional.ofNullable(storageOptionsProvider));
     dataset.allocator = allocator;
     return dataset;
   }
@@ -213,8 +211,7 @@ public class Dataset implements Closeable {
       Optional<String> mode,
       Optional<Boolean> enableStableRowIds,
       Optional<String> dataStorageVersion,
-      Map<String, String> storageOptions,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds);
+      Map<String, String> storageOptions);
 
   private static native Dataset createWithFfiStream(
       long arrowStreamMemoryAddress,
@@ -225,8 +222,7 @@ public class Dataset implements Closeable {
       Optional<String> mode,
       Optional<Boolean> enableStableRowIds,
       Optional<String> dataStorageVersion,
-      Map<String, String> storageOptions,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds);
+      Map<String, String> storageOptions);
 
   private static native Dataset createWithFfiStreamAndProvider(
       long arrowStreamMemoryAddress,
@@ -238,8 +234,7 @@ public class Dataset implements Closeable {
       Optional<Boolean> enableStableRowIds,
       Optional<String> dataStorageVersion,
       Map<String, String> storageOptions,
-      Optional<StorageOptionsProvider> storageOptionsProvider,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds);
+      Optional<StorageOptionsProvider> storageOptionsProvider);
 
   /**
    * Open a dataset from the specified path.
@@ -317,8 +312,7 @@ public class Dataset implements Closeable {
             options.getMetadataCacheSizeBytes(),
             options.getStorageOptions(),
             options.getSerializedManifest(),
-            options.getStorageOptionsProvider(),
-            options.getS3CredentialsRefreshOffsetSeconds());
+            options.getStorageOptionsProvider());
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
     return dataset;
@@ -332,8 +326,7 @@ public class Dataset implements Closeable {
       long metadataCacheSizeBytes,
       Map<String, String> storageOptions,
       Optional<ByteBuffer> serializedManifest,
-      Optional<StorageOptionsProvider> storageOptionsProvider,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds);
+      Optional<StorageOptionsProvider> storageOptionsProvider);
 
   /**
    * Creates a builder for opening a dataset.
@@ -685,6 +678,42 @@ public class Dataset implements Closeable {
   }
 
   private native long nativeGetLatestVersionId();
+
+  /**
+   * Get the initial storage options used to open this dataset.
+   *
+   * <p>This returns the options that were provided when the dataset was opened, without any refresh
+   * from the provider. Returns null if no storage options were provided.
+   *
+   * @return the initial storage options, or null if none were provided
+   */
+  public Map<String, String> getInitialStorageOptions() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetInitialStorageOptions();
+    }
+  }
+
+  private native Map<String, String> nativeGetInitialStorageOptions();
+
+  /**
+   * Get the latest storage options, potentially refreshed from the provider.
+   *
+   * <p>If a storage options provider was configured and credentials are expiring, this will refresh
+   * them.
+   *
+   * @return the latest storage options (static or refreshed from provider), or null if no storage
+   *     options were configured for this dataset
+   * @throws RuntimeException if an error occurs while fetching/refreshing options from the provider
+   */
+  public Map<String, String> getLatestStorageOptions() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetLatestStorageOptions();
+    }
+  }
+
+  private native Map<String, String> nativeGetLatestStorageOptions();
 
   /** Checkout the dataset to the latest version. */
   public void checkoutLatest() {

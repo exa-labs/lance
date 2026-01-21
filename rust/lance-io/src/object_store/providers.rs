@@ -172,7 +172,7 @@ impl ObjectStoreRegistry {
         };
 
         let cache_path =
-            provider.calculate_object_store_prefix(&base_path, params.storage_options.as_ref())?;
+            provider.calculate_object_store_prefix(&base_path, params.storage_options())?;
         let cache_key = (cache_path.clone(), params.clone());
 
         // Check if we have a cached store for this base path and params

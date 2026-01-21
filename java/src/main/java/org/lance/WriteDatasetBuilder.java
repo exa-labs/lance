@@ -80,7 +80,6 @@ public class WriteDatasetBuilder {
   private Optional<Long> maxBytesPerFile = Optional.empty();
   private Optional<Boolean> enableStableRowIds = Optional.empty();
   private Optional<WriteParams.LanceFileVersion> dataStorageVersion = Optional.empty();
-  private Optional<Long> s3CredentialsRefreshOffsetSeconds = Optional.empty();
 
   /** Creates a new builder instance. Package-private, use Dataset.write() instead. */
   WriteDatasetBuilder() {
@@ -275,21 +274,6 @@ public class WriteDatasetBuilder {
   }
 
   /**
-   * Sets the S3 credentials refresh offset in seconds.
-   *
-   * <p>This parameter controls how long before credential expiration to refresh them. For example,
-   * if credentials expire at T+60s and this is set to 10, credentials will be refreshed at T+50s.
-   *
-   * @param s3CredentialsRefreshOffsetSeconds Refresh offset in seconds
-   * @return this builder instance
-   */
-  public WriteDatasetBuilder s3CredentialsRefreshOffsetSeconds(
-      long s3CredentialsRefreshOffsetSeconds) {
-    this.s3CredentialsRefreshOffsetSeconds = Optional.of(s3CredentialsRefreshOffsetSeconds);
-    return this;
-  }
-
-  /**
    * Executes the write operation and returns the created dataset.
    *
    * <p>If a namespace is configured via namespace()+tableId(), this automatically handles table
@@ -412,8 +396,6 @@ public class WriteDatasetBuilder {
     maxBytesPerFile.ifPresent(paramsBuilder::withMaxBytesPerFile);
     enableStableRowIds.ifPresent(paramsBuilder::withEnableStableRowIds);
     dataStorageVersion.ifPresent(paramsBuilder::withDataStorageVersion);
-    s3CredentialsRefreshOffsetSeconds.ifPresent(
-        paramsBuilder::withS3CredentialsRefreshOffsetSeconds);
 
     WriteParams params = paramsBuilder.build();
 
@@ -436,8 +418,6 @@ public class WriteDatasetBuilder {
     maxBytesPerFile.ifPresent(paramsBuilder::withMaxBytesPerFile);
     enableStableRowIds.ifPresent(paramsBuilder::withEnableStableRowIds);
     dataStorageVersion.ifPresent(paramsBuilder::withDataStorageVersion);
-    s3CredentialsRefreshOffsetSeconds.ifPresent(
-        paramsBuilder::withS3CredentialsRefreshOffsetSeconds);
 
     WriteParams params = paramsBuilder.build();
 

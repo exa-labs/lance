@@ -91,6 +91,7 @@ use crate::rt;
 use crate::scanner::ScanStatistics;
 use crate::schema::{logical_schema_from_lance, LanceSchema};
 use crate::session::Session;
+use crate::storage_options::PyStorageOptionsAccessor;
 use crate::utils::PyLance;
 use crate::{LanceReader, Scanner};
 
@@ -456,8 +457,9 @@ pub struct Dataset {
 #[pymethods]
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
+    #[allow(deprecated)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, storage_options_provider=None, s3_credentials_refresh_offset_seconds=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, storage_options_provider=None))]
     fn new(
         py: Python,
         uri: String,
@@ -472,8 +474,7 @@ impl Dataset {
         index_cache_size_bytes: Option<usize>,
         read_params: Option<&Bound<PyDict>>,
         session: Option<Session>,
-        storage_options_provider: Option<PyObject>,
-        s3_credentials_refresh_offset_seconds: Option<u64>,
+        storage_options_provider: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -490,16 +491,12 @@ impl Dataset {
             let index_cache_size_bytes = index_cache_size * 20 * 1024 * 1024;
             params.index_cache_size_bytes(index_cache_size_bytes);
         }
-        // Set up store options (block size and S3 credentials refresh offset)
-        let mut store_params = params.store_options.take().unwrap_or_default();
+        // Set up store options (block size)
         if let Some(block_size) = block_size {
+            let mut store_params = params.store_options.take().unwrap_or_default();
             store_params.block_size = Some(block_size);
+            params.store_options = Some(store_params);
         }
-        if let Some(offset_seconds) = s3_credentials_refresh_offset_seconds {
-            store_params.s3_credentials_refresh_offset =
-                std::time::Duration::from_secs(offset_seconds);
-        }
-        params.store_options = Some(store_params);
         if let Some(commit_handler) = commit_handler {
             let py_commit_lock = PyCommitLock::new(commit_handler);
             params.set_commit_lock(Arc::new(py_commit_lock));
@@ -1447,8 +1444,40 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
-    fn checkout_version(&self, py: Python, version: PyObject) -> PyResult<Self> {
-        let reference = self.transform_ref(py, Some(version))?;
+    /// Get the initial storage options used to open this dataset.
+    ///
+    /// This returns the options that were provided when the dataset was opened,
+    /// without any refresh from the provider. Returns None if no storage options
+    /// were provided.
+    fn initial_storage_options(&self) -> Option<HashMap<String, String>> {
+        self.ds.initial_storage_options().cloned()
+    }
+
+    /// Get the latest storage options, potentially refreshed from the provider.
+    ///
+    /// If a storage options provider was configured and credentials are expiring,
+    /// this will refresh them. Returns the current valid storage options, or None
+    /// if no storage options accessor is configured.
+    fn latest_storage_options(self_: PyRef<'_, Self>) -> PyResult<Option<HashMap<String, String>>> {
+        let result = rt()
+            .block_on(Some(self_.py()), self_.ds.latest_storage_options())?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        Ok(result.map(|opts| opts.0))
+    }
+
+    /// Get the storage options accessor for this dataset.
+    ///
+    /// The accessor bundles static storage options and optional dynamic provider,
+    /// handling caching and refresh logic internally.
+    fn storage_options_accessor(&self) -> Option<PyStorageOptionsAccessor> {
+        self.ds
+            .storage_options_accessor()
+            .map(PyStorageOptionsAccessor::new)
+    }
+
+    fn checkout_version(&self, version: Bound<'_, PyAny>) -> PyResult<Self> {
+        let reference =
+            Python::with_gil(|py| self.transform_ref(py, Some(version.clone().unbind())))?;
         self._checkout_version(reference)
     }
 
@@ -1465,7 +1494,9 @@ impl Dataset {
         // `version` can be a version number or a tag name.
         // `storage_options` will be forwarded to the object store params for the new dataset.
         let store_params = storage_options.as_ref().map(|opts| ObjectStoreParams {
-            storage_options: Some(opts.clone()),
+            storage_options_accessor: Some(Arc::new(
+                lance::io::StorageOptionsAccessor::with_static_options(opts.clone()),
+            )),
             ..Default::default()
         });
 
@@ -1647,7 +1678,9 @@ impl Dataset {
         // Build Ref from python object
         let reference = self.transform_ref(py, reference)?;
         let store_params = storage_options.map(|opts| ObjectStoreParams {
-            storage_options: Some(opts),
+            storage_options_accessor: Some(Arc::new(
+                lance::io::StorageOptionsAccessor::with_static_options(opts),
+            )),
             ..Default::default()
         });
         let created = rt()
@@ -2099,7 +2132,7 @@ impl Dataset {
         read_version: Option<u64>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<PyObject>,
+        storage_options_provider: Option<&Bound<'_, PyAny>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
@@ -2127,6 +2160,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(deprecated)]
     #[staticmethod]
     #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
     fn commit_transaction(
@@ -2134,25 +2168,19 @@ impl Dataset {
         transaction: PyLance<Transaction>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<PyObject>,
+        storage_options_provider: Option<&Bound<'_, PyAny>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
     ) -> PyResult<Self> {
-        let provider = storage_options_provider.and_then(|py_obj| {
-            crate::storage_options::PyStorageOptionsProvider::new(py_obj)
-                .ok()
-                .map(|py_provider| {
-                    Arc::new(
-                        crate::storage_options::PyStorageOptionsProviderWrapper::new(py_provider),
-                    ) as Arc<dyn lance_io::object_store::StorageOptionsProvider>
-                })
-        });
+        let accessor = crate::storage_options::create_accessor_from_python(
+            storage_options.clone(),
+            storage_options_provider,
+        )?;
 
-        let object_store_params = if storage_options.is_some() || provider.is_some() {
+        let object_store_params = if accessor.is_some() {
             Some(ObjectStoreParams {
-                storage_options: storage_options.clone(),
-                storage_options_provider: provider,
+                storage_options_accessor: accessor,
                 ..Default::default()
             })
         } else {
@@ -2196,6 +2224,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(deprecated)]
     #[staticmethod]
     #[pyo3(signature = (dest, transactions, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
     fn commit_batch(
@@ -2203,25 +2232,19 @@ impl Dataset {
         transactions: Vec<PyLance<Transaction>>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<PyObject>,
+        storage_options_provider: Option<&Bound<'_, PyAny>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
     ) -> PyResult<(Self, PyLance<Transaction>)> {
-        let provider = storage_options_provider.and_then(|py_obj| {
-            crate::storage_options::PyStorageOptionsProvider::new(py_obj)
-                .ok()
-                .map(|py_provider| {
-                    Arc::new(
-                        crate::storage_options::PyStorageOptionsProviderWrapper::new(py_provider),
-                    ) as Arc<dyn lance_io::object_store::StorageOptionsProvider>
-                })
-        });
+        let accessor = crate::storage_options::create_accessor_from_python(
+            storage_options.clone(),
+            storage_options_provider,
+        )?;
 
-        let object_store_params = if storage_options.is_some() || provider.is_some() {
+        let object_store_params = if accessor.is_some() {
             Some(ObjectStoreParams {
-                storage_options: storage_options.clone(),
-                storage_options_provider: provider,
+                storage_options_accessor: accessor,
                 ..Default::default()
             })
         } else {
@@ -3006,6 +3029,7 @@ fn get_dict_opt<'a, 'py, D: FromPyObject<'a>>(
         .transpose()
 }
 
+#[allow(deprecated)]
 pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WriteParams>> {
     let params = if options.is_none() {
         None
@@ -3033,34 +3057,17 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
 
         let storage_options = get_dict_opt::<HashMap<String, String>>(options, "storage_options")?;
         let storage_options_provider =
-            get_dict_opt::<PyObject>(options, "storage_options_provider")?.and_then(|py_obj| {
-                crate::storage_options::PyStorageOptionsProvider::new(py_obj)
-                    .ok()
-                    .map(|py_provider| {
-                        Arc::new(
-                            crate::storage_options::PyStorageOptionsProviderWrapper::new(
-                                py_provider,
-                            ),
-                        )
-                            as Arc<dyn lance_io::object_store::StorageOptionsProvider>
-                    })
-            });
+            get_dict_opt::<Py<PyAny>>(options, "storage_options_provider")?;
 
-        let s3_credentials_refresh_offset_seconds =
-            get_dict_opt::<u64>(options, "s3_credentials_refresh_offset_seconds")?;
-
-        if storage_options.is_some()
-            || storage_options_provider.is_some()
-            || s3_credentials_refresh_offset_seconds.is_some()
-        {
-            let s3_credentials_refresh_offset = s3_credentials_refresh_offset_seconds
-                .map(std::time::Duration::from_secs)
-                .unwrap_or(std::time::Duration::from_secs(60));
-
-            p.store_params = Some(ObjectStoreParams {
+        if storage_options.is_some() || storage_options_provider.is_some() {
+            let accessor = crate::storage_options::create_accessor_from_python(
                 storage_options,
-                storage_options_provider,
-                s3_credentials_refresh_offset,
+                storage_options_provider
+                    .as_ref()
+                    .map(|py_obj| py_obj.bind(options.py())),
+            )?;
+            p.store_params = Some(ObjectStoreParams {
+                storage_options_accessor: accessor,
                 ..Default::default()
             });
         }

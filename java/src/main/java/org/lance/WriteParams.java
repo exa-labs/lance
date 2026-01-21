@@ -56,7 +56,6 @@ public class WriteParams {
   private final Optional<Boolean> enableStableRowIds;
   private final Optional<LanceFileVersion> dataStorageVersion;
   private Map<String, String> storageOptions = new HashMap<>();
-  private final Optional<Long> s3CredentialsRefreshOffsetSeconds;
 
   private WriteParams(
       Optional<Integer> maxRowsPerFile,
@@ -65,8 +64,7 @@ public class WriteParams {
       Optional<WriteMode> mode,
       Optional<Boolean> enableStableRowIds,
       Optional<LanceFileVersion> dataStorageVersion,
-      Map<String, String> storageOptions,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds) {
+      Map<String, String> storageOptions) {
     this.maxRowsPerFile = maxRowsPerFile;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
@@ -74,7 +72,6 @@ public class WriteParams {
     this.enableStableRowIds = enableStableRowIds;
     this.dataStorageVersion = dataStorageVersion;
     this.storageOptions = storageOptions;
-    this.s3CredentialsRefreshOffsetSeconds = s3CredentialsRefreshOffsetSeconds;
   }
 
   public Optional<Integer> getMaxRowsPerFile() {
@@ -110,10 +107,6 @@ public class WriteParams {
     return storageOptions;
   }
 
-  public Optional<Long> getS3CredentialsRefreshOffsetSeconds() {
-    return s3CredentialsRefreshOffsetSeconds;
-  }
-
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -134,7 +127,6 @@ public class WriteParams {
     private Optional<Boolean> enableStableRowIds = Optional.empty();
     private Optional<LanceFileVersion> dataStorageVersion = Optional.empty();
     private Map<String, String> storageOptions = new HashMap<>();
-    private Optional<Long> s3CredentialsRefreshOffsetSeconds = Optional.empty();
 
     public Builder withMaxRowsPerFile(int maxRowsPerFile) {
       this.maxRowsPerFile = Optional.of(maxRowsPerFile);
@@ -171,11 +163,6 @@ public class WriteParams {
       return this;
     }
 
-    public Builder withS3CredentialsRefreshOffsetSeconds(long s3CredentialsRefreshOffsetSeconds) {
-      this.s3CredentialsRefreshOffsetSeconds = Optional.of(s3CredentialsRefreshOffsetSeconds);
-      return this;
-    }
-
     public WriteParams build() {
       return new WriteParams(
           maxRowsPerFile,
@@ -184,8 +171,7 @@ public class WriteParams {
           mode,
           enableStableRowIds,
           dataStorageVersion,
-          storageOptions,
-          s3CredentialsRefreshOffsetSeconds);
+          storageOptions);
     }
   }
 }
