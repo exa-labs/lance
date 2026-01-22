@@ -740,6 +740,9 @@ class PartitionStats:
     docs_count: int
     term_count: int
     lengths_summary: Dict[str, Optional[float]]
+    short_posting_count: int
+    short_posting_total_length: int
+    uncompressed_length: int
     bytes_total: int
     bytes_breakdown: Dict[str, int]
     tokens: Optional[set] = None
@@ -881,6 +884,9 @@ def analyze_fts(
     sizes: List[int] = []
     bytes_totals: List[int] = []
     all_terms: Optional[set] = set() if compute_union else None
+    global_short_count = 0
+    global_short_total = 0
+    global_uncompressed = 0
 
     compare_ids = set(compare) if compare else set()
 
@@ -899,6 +905,18 @@ def analyze_fts(
         tokens = _load_tokens(tokens_reader, detected_format, need_id_map, need_set)
         if all_terms is not None and tokens.tokens is not None:
             all_terms.update(tokens.tokens)
+
+        short_count = 0
+        short_total = 0
+        uncompressed = 0
+        for length in lengths:
+            if length < 128:
+                short_count += 1
+                short_total += length
+            uncompressed += length % 128
+        global_short_count += short_count
+        global_short_total += short_total
+        global_uncompressed += uncompressed
 
         bytes_breakdown = {
             "tokens": _file_size(tokens_reader),
@@ -923,6 +941,9 @@ def analyze_fts(
                 docs_count=docs_count,
                 term_count=tokens.count,
                 lengths_summary=_summarize(lengths),
+                short_posting_count=short_count,
+                short_posting_total_length=short_total,
+                uncompressed_length=uncompressed,
                 bytes_total=bytes_total,
                 bytes_breakdown=bytes_breakdown,
                 tokens=tokens.tokens,
@@ -959,6 +980,11 @@ def analyze_fts(
                 "docs_count": p.docs_count,
                 "term_count": p.term_count,
                 "posting_list_length_summary": p.lengths_summary,
+                "short_posting_lists": {
+                    "count": p.short_posting_count,
+                    "total_length": p.short_posting_total_length,
+                },
+                "uncompressed_length": p.uncompressed_length,
                 "bytes_total": p.bytes_total,
                 "bytes_breakdown": p.bytes_breakdown,
                 "term_lengths": p.term_lengths,
@@ -968,6 +994,11 @@ def analyze_fts(
         "partition_count": len(partitions),
         "docs_count_summary": _summarize(sizes),
         "bytes_summary": _summarize(bytes_totals),
+        "short_posting_lists": {
+            "count": global_short_count,
+            "total_length": global_short_total,
+        },
+        "uncompressed_length": global_uncompressed,
         "unique_terms": len(all_terms) if all_terms is not None else None,
         "compare": compare_stats,
     }
@@ -993,8 +1024,20 @@ def _fts_text_report(stats: Dict[str, object], verbose: bool) -> str:
         f"Partitions: {stats['partition_count']}",
         f"Docs count summary: {stats['docs_count_summary']}",
         f"Bytes summary: {stats['bytes_summary']}",
+        f"Short posting lists (global): {stats['short_posting_lists']}",
+        f"Uncompressed length (global): {stats['uncompressed_length']}",
         f"Unique terms (union): {stats['unique_terms']}",
     ]
+    lines.append("Short posting lists per partition:")
+    for part in stats["partitions"]:
+        short_stats = part["short_posting_lists"]
+        lines.append(
+            "  "
+            f"partition {part['partition_id']}: "
+            f"short_count={short_stats['count']}, "
+            f"short_total_length={short_stats['total_length']}, "
+            f"uncompressed_length={part['uncompressed_length']}"
+        )
     if verbose:
         lines.append("Partition details:")
         for part in stats["partitions"]:

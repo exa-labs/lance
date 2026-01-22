@@ -171,6 +171,9 @@ def test_analyze_fts_arrow(tmp_path: Path) -> None:
     assert stats["partition_count"] == 2
     assert stats["unique_terms"] == 3
     assert stats["bytes_summary"]["count"] == 2
+    assert stats["short_posting_lists"]["count"] == 4
+    assert stats["short_posting_lists"]["total_length"] == 17
+    assert stats["uncompressed_length"] == 17
 
     compare = stats["compare"]
     assert compare["common_terms"] == 1
@@ -186,6 +189,12 @@ def test_analyze_fts_arrow(tmp_path: Path) -> None:
     assert part0["term_lengths"]["banana"] == 5
     assert part1["term_lengths"]["banana"] == 2
     assert part1["term_lengths"]["date"] == 7
+    assert part0["short_posting_lists"]["count"] == 2
+    assert part0["short_posting_lists"]["total_length"] == 8
+    assert part1["short_posting_lists"]["count"] == 2
+    assert part1["short_posting_lists"]["total_length"] == 9
+    assert part0["uncompressed_length"] == 8
+    assert part1["uncompressed_length"] == 9
 
 
 def test_parse_args_preserves_object_uri() -> None:
