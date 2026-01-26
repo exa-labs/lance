@@ -112,11 +112,9 @@ impl ScalarQuantizer {
         let lower_index = clip_count;
         let upper_index = data.len() - 1 - clip_count;
         let mut values: Vec<f64> = data.iter().map(|v| v.as_()).collect();
-        let (_, lower, _) =
-            values.select_nth_unstable_by(lower_index, |a, b| a.total_cmp(b));
+        let (_, lower, _) = values.select_nth_unstable_by(lower_index, |a, b| a.total_cmp(b));
         let lower = *lower;
-        let (_, upper, _) =
-            values.select_nth_unstable_by(upper_index, |a, b| a.total_cmp(b));
+        let (_, upper, _) = values.select_nth_unstable_by(upper_index, |a, b| a.total_cmp(b));
         let upper = *upper;
 
         self.metadata.bounds = lower..upper;
@@ -201,10 +199,7 @@ impl Quantization for ScalarQuantizer {
         quantizer.metadata.clip = params.clip;
         if !(0.0..50.0).contains(&params.clip) {
             return Err(Error::invalid_input(
-                format!(
-                    "SQ builder: clip must be in [0, 50), got {}",
-                    params.clip
-                ),
+                format!("SQ builder: clip must be in [0, 50), got {}", params.clip),
                 location!(),
             ));
         }
@@ -426,8 +421,8 @@ mod tests {
             ..Default::default()
         };
 
-        let sq = <ScalarQuantizer as Quantization>::build(&vectors, DistanceType::L2, &params)
-            .unwrap();
+        let sq =
+            <ScalarQuantizer as Quantization>::build(&vectors, DistanceType::L2, &params).unwrap();
 
         assert_eq!(sq.bounds().start, 5.0);
         assert_eq!(sq.bounds().end, 994.0);
