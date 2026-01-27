@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{ops::Range, sync::Arc};
+use std::{cmp::Ordering, ops::Range, sync::Arc};
 
 use arrow::array::AsArray;
 use arrow::datatypes::{Float16Type, Float32Type, Float64Type};
@@ -90,7 +90,22 @@ impl ScalarQuantizer {
             })?
             .as_slice();
 
-        if data.is_empty() {
+        let dim = vectors.value_length() as usize;
+        if dim == 0 {
+            return Err(Error::invalid_input(
+                "SQ builder: vector dimension must be > 0".to_string(),
+                location!(),
+            ));
+        }
+        if data.len() % dim != 0 {
+            return Err(Error::invalid_input(
+                "SQ builder: vector buffer length is not divisible by dimension".to_string(),
+                location!(),
+            ));
+        }
+
+        let num_rows = data.len() / dim;
+        if num_rows == 0 {
             return Ok(self.metadata.bounds.clone());
         }
 
@@ -101,7 +116,7 @@ impl ScalarQuantizer {
             return Ok(self.metadata.bounds.clone());
         }
 
-        let clip_count = ((data.len() as f64) * (clip / 100.0)).floor() as usize;
+        let clip_count = ((num_rows as f64) * (clip / 100.0)).floor() as usize;
         if clip_count == 0 {
             self.metadata.bounds = data.iter().fold(self.metadata.bounds.clone(), |f, v| {
                 f.start.min(v.as_())..f.end.max(v.as_())
@@ -110,14 +125,42 @@ impl ScalarQuantizer {
         }
 
         let lower_index = clip_count;
-        let upper_index = data.len() - 1 - clip_count;
-        let mut values: Vec<f64> = data.iter().map(|v| v.as_()).collect();
-        let (_, lower, _) = values.select_nth_unstable_by(lower_index, |a, b| a.total_cmp(b));
-        let lower = *lower;
-        let (_, upper, _) = values.select_nth_unstable_by(upper_index, |a, b| a.total_cmp(b));
-        let upper = *upper;
+        let upper_index = num_rows - 1 - clip_count;
+        let mut global_lower: Option<f64> = None;
+        let mut global_upper: Option<f64> = None;
 
-        self.metadata.bounds = lower..upper;
+        for dim_index in 0..dim {
+            let mut values: Vec<f64> = Vec::with_capacity(num_rows);
+            let mut offset = dim_index;
+            for _ in 0..num_rows {
+                values.push(data[offset].as_());
+                offset += dim;
+            }
+
+            let (_, lower, _) =
+                values.select_nth_unstable_by(lower_index, |a, b| a.total_cmp(b));
+            let lower = *lower;
+            let (_, upper, _) =
+                values.select_nth_unstable_by(upper_index, |a, b| a.total_cmp(b));
+            let upper = *upper;
+
+            global_lower = Some(match global_lower {
+                None => lower,
+                Some(current) => match lower.total_cmp(&current) {
+                    Ordering::Less => lower,
+                    _ => current,
+                },
+            });
+            global_upper = Some(match global_upper {
+                None => upper,
+                Some(current) => match upper.total_cmp(&current) {
+                    Ordering::Greater => upper,
+                    _ => current,
+                },
+            });
+        }
+
+        self.metadata.bounds = global_lower.unwrap()..global_upper.unwrap();
         Ok(self.metadata.bounds.clone())
     }
 
@@ -426,6 +469,29 @@ mod tests {
 
         assert_eq!(sq.bounds().start, 5.0);
         assert_eq!(sq.bounds().end, 994.0);
+    }
+
+    #[tokio::test]
+    async fn test_sq_build_with_clip_per_dim() {
+        let mut values = Vec::with_capacity(20);
+        for i in 0..10 {
+            let d0 = if i == 9 { 1000.0 } else { 0.0 };
+            let d1 = if i == 9 { 2.0 } else { 1.0 };
+            values.push(d0);
+            values.push(d1);
+        }
+        let float_array = Float64Array::from_iter_values(values);
+        let vectors = FixedSizeListArray::try_new_from_values(float_array, 2).unwrap();
+        let params = SQBuildParams {
+            clip: 10.0,
+            ..Default::default()
+        };
+
+        let sq =
+            <ScalarQuantizer as Quantization>::build(&vectors, DistanceType::L2, &params).unwrap();
+
+        assert_eq!(sq.bounds().start, 0.0);
+        assert_eq!(sq.bounds().end, 1.0);
     }
 
     #[tokio::test]
