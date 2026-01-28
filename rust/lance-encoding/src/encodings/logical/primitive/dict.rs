@@ -182,7 +182,9 @@ where
         let indices_bytes = indices_buffer
             .len()
             .saturating_mul(DICT_INDICES_BITS_PER_VALUE as usize / 8);
-        let offsets_bytes = dictionary_offsets_buffer.len().saturating_mul(bytes_per_offset);
+        let offsets_bytes = dictionary_offsets_buffer
+            .len()
+            .saturating_mul(bytes_per_offset);
         let encoded_size = dictionary_buffer
             .len()
             .saturating_add(indices_bytes)
@@ -348,9 +350,7 @@ pub fn dictionary_encode(mut data_block: DataBlock) -> Option<(DataBlock, DataBl
                 _ => None,
             }
         }
-        _ => {
-            None
-        }
+        _ => None,
     }
 }
 
