@@ -47,7 +47,7 @@
 //! contain a power-of-2 number of values.
 //!
 //! NOTE: The current encoder uses a 2048-value cap per chunk as a workaround for
-//! https://github.com/lancedb/lance/issues/4429.
+//! <https://github.com/lancedb/lance/issues/4429>.
 //!
 //! ## Block Format
 //!
@@ -579,9 +579,8 @@ impl BlockDecompressor for RleDecompressor {
             });
         }
 
-        let values_size_bytes: [u8; 8] = data[..8]
-            .try_into()
-            .expect("slice length already checked");
+        let values_size_bytes: [u8; 8] =
+            data[..8].try_into().expect("slice length already checked");
         let values_size: u64 = u64::from_le_bytes(values_size_bytes);
 
         // parse values
@@ -590,12 +589,13 @@ impl BlockDecompressor for RleDecompressor {
             location: location!(),
             source: format!("Invalid values buffer size: {}", values_size).into(),
         })?;
-        let lengths_start = values_start.checked_add(values_size).ok_or_else(|| {
-            Error::InvalidInput {
-                location: location!(),
-                source: "Invalid RLE values buffer size".into(),
-            }
-        })?;
+        let lengths_start =
+            values_start
+                .checked_add(values_size)
+                .ok_or_else(|| Error::InvalidInput {
+                    location: location!(),
+                    source: "Invalid RLE values buffer size".into(),
+                })?;
 
         if data.len() < lengths_start {
             return Err(Error::InvalidInput {

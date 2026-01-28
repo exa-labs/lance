@@ -1057,7 +1057,10 @@ fn validate_rle_compression(rle: &crate::format::pb21::Rle) -> Result<u64> {
     };
 
     let run_lengths = run_lengths.compression.as_ref().ok_or_else(|| {
-        Error::invalid_input("RLE compression missing run lengths compression", location!())
+        Error::invalid_input(
+            "RLE compression missing run lengths compression",
+            location!(),
+        )
     })?;
     let Compression::Flat(run_lengths) = run_lengths else {
         return Err(Error::invalid_input(
