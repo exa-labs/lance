@@ -4330,7 +4330,7 @@ impl PrimitiveStructuralEncoder {
                 let avg_value_size = (var.data.len() as u64) / num_values;
 
                 let dict_values_size = cardinality.checked_mul(avg_value_size)?;
-                let dict_offsets_size = (cardinality + 1).checked_mul(bytes_per_offset)?;
+                let dict_offsets_size = cardinality.checked_mul(bytes_per_offset)?;
                 let indices_size = num_values.checked_mul(DICT_INDICES_BITS_PER_VALUE / 8)?;
 
                 dict_values_size
