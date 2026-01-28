@@ -164,7 +164,15 @@ impl ScalarQuantizer {
             });
         }
 
-        self.metadata.bounds = global_lower.unwrap()..global_upper.unwrap();
+        self.metadata.bounds = match (global_lower, global_upper) {
+            (Some(lower), Some(upper)) => lower..upper,
+            _ => {
+                return Err(Error::invalid_input(
+                    "SQ builder: too few values to compute bounds",
+                    location!(),
+                ));
+            }
+        };
         Ok(self.metadata.bounds.clone())
     }
 
