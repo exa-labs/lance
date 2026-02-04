@@ -122,7 +122,7 @@ pub struct RabitQuantizationStorage {
     scale_factors: Float32Array,
 
     // Optional per-partition precomputed rotated IVF centroid (c * R), cached at load time.
-    rotated_centroid: Option<Arc<Vec<f32>>>,
+    rotated_centroid: Option<Arc<Float32Array>>,
 }
 
 impl DeepSizeOf for RabitQuantizationStorage {
@@ -230,6 +230,39 @@ where
         .zip(dist_table.chunks_exact_mut(SEGMENT_NUM_CODES))
         .for_each(|(sub_vec, dist_table)| build_dist_table_for_subvec::<T>(sub_vec, dist_table));
     dist_table
+}
+
+#[inline]
+fn build_dist_table_direct_f32(qc: &[f32]) -> (Vec<f32>, f32) {
+    let mut dist_table = vec![0.0; qc.len() * 4];
+    let mut sum_q = 0.0;
+    qc.chunks_exact(SEGMENT_LENGTH)
+        .zip(dist_table.chunks_exact_mut(SEGMENT_NUM_CODES))
+        .for_each(|(sub_vec, dist_table)| {
+            sum_q += sub_vec.iter().sum::<f32>();
+            build_dist_table_for_subvec::<Float32Type>(sub_vec, dist_table);
+        });
+    (dist_table, sum_q)
+}
+
+#[inline]
+fn build_dist_table_direct_diff_f32(q: &[f32], c: &[f32]) -> (Vec<f32>, f32) {
+    debug_assert_eq!(q.len(), c.len());
+    let mut dist_table = vec![0.0; q.len() * 4];
+    let mut sum_q = 0.0;
+    q.chunks_exact(SEGMENT_LENGTH)
+        .zip(c.chunks_exact(SEGMENT_LENGTH))
+        .zip(dist_table.chunks_exact_mut(SEGMENT_NUM_CODES))
+        .for_each(|((q_sub, c_sub), dist_table)| {
+            let diff0 = q_sub[0] - c_sub[0];
+            let diff1 = q_sub[1] - c_sub[1];
+            let diff2 = q_sub[2] - c_sub[2];
+            let diff3 = q_sub[3] - c_sub[3];
+            let diff = [diff0, diff1, diff2, diff3];
+            sum_q += diff0 + diff1 + diff2 + diff3;
+            build_dist_table_for_subvec::<Float32Type>(&diff, dist_table);
+        });
+    (dist_table, sum_q)
 }
 
 #[inline(always)]
@@ -427,37 +460,30 @@ impl VectorStore for RabitQuantizationStorage {
         let code_dim = rotate_mat.len();
         let dim = code_dim / self.metadata.num_bits as usize;
 
-        let rotated_qr = match (self.rotated_centroid.as_ref(), qr.len() == code_dim) {
-            (Some(c_r), true) => {
-                // Fast path: query is already rotated (q * R) and we have c * R cached
-                let q_r = qr
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "RabitQ fast path requires Float32Array query, got {}",
-                            qr.data_type()
-                        )
-                    });
-                q_r.values()
-                    .iter()
-                    .zip(c_r.iter())
-                    .map(|(qv, cv)| qv - cv)
-                    .collect::<Vec<f32>>()
-            }
-            _ => {
-                // Slow path (legacy): query is residual (q - c), rotate it per partition
-                match rotate_mat.value_type() {
-                    DataType::Float16 => Self::rotate_query_vector::<Float16Type>(rotate_mat, &qr),
-                    DataType::Float32 => Self::rotate_query_vector::<Float32Type>(rotate_mat, &qr),
-                    DataType::Float64 => Self::rotate_query_vector::<Float64Type>(rotate_mat, &qr),
-                    dt => unimplemented!("RabitQ does not support data type: {}", dt),
-                }
-            }
+        let (dist_table, sum_q) = if let Some(c_r) = self.rotated_centroid.as_ref() {
+            // Fast path (IVF_RQ): query is q*R (precomputed once per query), and we cached c*R.
+            //
+            // Build dist table from (q*R - c*R) without allocating the intermediate vector.
+            let q_r = qr
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "RabitQ fast path requires Float32Array query, got {}",
+                        qr.data_type()
+                    )
+                });
+            build_dist_table_direct_diff_f32(q_r.values(), c_r.values())
+        } else {
+            // Legacy path: query is residual (q - c), rotate it per partition.
+            let rotated_qr = match rotate_mat.value_type() {
+                DataType::Float16 => Self::rotate_query_vector::<Float16Type>(rotate_mat, &qr),
+                DataType::Float32 => Self::rotate_query_vector::<Float32Type>(rotate_mat, &qr),
+                DataType::Float64 => Self::rotate_query_vector::<Float64Type>(rotate_mat, &qr),
+                dt => unimplemented!("RabitQ does not support data type: {}", dt),
+            };
+            build_dist_table_direct_f32(&rotated_qr)
         };
-
-        let dist_table = build_dist_table_direct::<Float32Type>(&rotated_qr);
-        let sum_q = rotated_qr.into_iter().sum();
 
         let q_factor = match self.distance_type {
             DistanceType::L2 => dist_q_c,
@@ -498,7 +524,7 @@ impl IvfPartitionCentroid for RabitQuantizationStorage {
         })?;
         let code_dim = rotate_mat.len();
 
-        let rotated = if let Some(rotated_centroid) = rotated_centroid {
+        let rotated: Arc<Float32Array> = if let Some(rotated_centroid) = rotated_centroid {
             let arr = rotated_centroid
                 .as_any()
                 .downcast_ref::<Float32Array>()
@@ -521,9 +547,9 @@ impl IvfPartitionCentroid for RabitQuantizationStorage {
                     location!(),
                 ));
             }
-            arr.values().to_vec()
+            Arc::new(arr.clone())
         } else {
-            match rotate_mat.value_type() {
+            let rotated = match rotate_mat.value_type() {
                 DataType::Float16 => {
                     Self::rotate_query_vector::<Float16Type>(rotate_mat, centroid.as_ref())
                 }
@@ -539,10 +565,11 @@ impl IvfPartitionCentroid for RabitQuantizationStorage {
                         location!(),
                     ))
                 }
-            }
+            };
+            Arc::new(Float32Array::from(rotated))
         };
 
-        self.rotated_centroid = Some(Arc::new(rotated));
+        self.rotated_centroid = Some(rotated);
         Ok(())
     }
 }

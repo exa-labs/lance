@@ -749,7 +749,7 @@ impl ANNIvfSubIndexExec {
                 let rotated = rq.rotate_vector(query.key.as_ref()).map_err(|e| {
                     DataFusionError::Execution(format!("Failed to rotate query: {}", e))
                 })?;
-                query.rabit_rotated_key = Some(rotated as ArrayRef);
+                query.rabit_rotated_key = Some(rotated);
             }
         }
 
@@ -766,11 +766,6 @@ impl ANNIvfSubIndexExec {
         state: Arc<ANNIvfEarlySearchResults>,
     ) -> futures::stream::BoxStream<'static, DataFusionResult<RecordBatch>> {
         let stream = futures::stream::once(async move {
-            let query = match Self::prepare_query_for_index(query, index.as_ref()) {
-                Ok(q) => q,
-                Err(e) => return futures::stream::once(async move { Err(e) }).boxed(),
-            };
-
             let max_nprobes = query
                 .maximum_nprobes
                 .unwrap_or(partitions.len())
@@ -888,11 +883,6 @@ impl ANNIvfSubIndexExec {
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
     ) -> futures::stream::BoxStream<'static, DataFusionResult<RecordBatch>> {
-        let query = match Self::prepare_query_for_index(query, index.as_ref()) {
-            Ok(q) => q,
-            Err(e) => return futures::stream::once(async move { Err(e) }).boxed(),
-        };
-
         let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
         metrics.partitions_searched.add(minimum_nprobes);
 
@@ -1081,6 +1071,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         let raw_index = ds
                             .open_vector_index(&column, &index_uuid, &metrics.index_metrics)
                             .await?;
+                        let query = Self::prepare_query_for_index(query, raw_index.as_ref())?;
 
                         let early_search = Self::initial_search(
                             raw_index.clone(),

@@ -121,7 +121,7 @@ pub struct Query {
     ///
     /// When present, IVF_RQ query-time can avoid per-partition rotation by using:
     /// `(q - c) * R = q * R - c * R`.
-    pub rabit_rotated_key: Option<ArrayRef>,
+    pub rabit_rotated_key: Option<Arc<Float32Array>>,
 }
 
 impl From<pb::VectorMetricType> for DistanceType {
