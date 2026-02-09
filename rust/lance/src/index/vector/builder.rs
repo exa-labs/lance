@@ -32,7 +32,10 @@ use lance_file::writer::FileWriter;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
-use lance_index::vector::bq::storage::{unpack_codes, RABIT_CODE_COLUMN};
+use lance_index::vector::bq::builder::RabitQuantizer;
+use lance_index::vector::bq::storage::{
+    unpack_codes, RabitCentroidSpace, RabitInputSpace, RABIT_CODE_COLUMN,
+};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
@@ -268,7 +271,36 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // step 1. train IVF & quantizer
         self.with_ivf(self.load_or_build_ivf().await?);
 
-        self.with_quantizer(self.load_or_build_quantizer().await?);
+        let mut quantizer = self.load_or_build_quantizer().await?;
+        if Q::quantization_type() == QuantizationType::Rabit {
+            let mut rabit_quantizer = RabitQuantizer::try_from(quantizer.clone().into())?;
+            if rabit_quantizer.code_dim() % 4 != 0 || rabit_quantizer.code_dim() % 8 != 0 {
+                return Err(Error::invalid_input(
+                    format!(
+                        "Rabit code dimension {} must be divisible by 8 and 4",
+                        rabit_quantizer.code_dim()
+                    ),
+                    location!(),
+                ));
+            }
+            if rabit_quantizer.centroid_space() != RabitCentroidSpace::Rotated {
+                let ivf = self.ivf.as_mut().ok_or(Error::invalid_input(
+                    "IVF model not set before rotating centroids",
+                    location!(),
+                ))?;
+                let centroids = ivf.centroids.as_ref().ok_or(Error::invalid_input(
+                    "IVF centroids not available",
+                    location!(),
+                ))?;
+                ivf.centroids = Some(rabit_quantizer.rotate_fsl(centroids)?);
+            }
+
+            rabit_quantizer.set_input_space(RabitInputSpace::Rotated);
+            rabit_quantizer.set_centroid_space(RabitCentroidSpace::Rotated);
+
+            quantizer = Q::try_from(rabit_quantizer.into())?;
+        }
+        self.with_quantizer(quantizer);
 
         // step 2. shuffle the dataset
         if self.shuffle_reader.is_none() {

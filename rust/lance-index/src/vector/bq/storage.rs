@@ -38,6 +38,22 @@ pub const RABIT_CODE_COLUMN: &str = "_rabit_codes";
 pub const SEGMENT_LENGTH: usize = 4;
 pub const SEGMENT_NUM_CODES: usize = 1 << SEGMENT_LENGTH;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RabitInputSpace {
+    #[default]
+    Raw,
+    Rotated,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RabitCentroidSpace {
+    #[default]
+    Raw,
+    Rotated,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RabitQuantizationMetadata {
     // this rotate matrix is large, and lance index would store all metadata in schema metadata,
@@ -48,6 +64,10 @@ pub struct RabitQuantizationMetadata {
     pub rotate_mat_position: u32,
     pub num_bits: u8,
     pub packed: bool,
+    #[serde(default)]
+    pub input_space: RabitInputSpace,
+    #[serde(default)]
+    pub centroid_space: RabitCentroidSpace,
 }
 
 impl DeepSizeOf for RabitQuantizationMetadata {
@@ -152,6 +172,20 @@ impl RabitQuantizationStorage {
         rotate_mat
             .chunks_exact(code_dim)
             .map(|chunk| lance_linalg::distance::dot(&chunk[..d], qr))
+            .collect()
+    }
+
+    fn query_vector_to_f32<T: ArrowFloatType>(query: &dyn Array) -> Vec<f32>
+    where
+        T::Native: AsPrimitive<f32>,
+    {
+        query
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .unwrap()
+            .as_slice()
+            .iter()
+            .map(|v| v.as_())
             .collect()
     }
 }
@@ -408,17 +442,26 @@ impl VectorStore for RabitQuantizationStorage {
     #[inline(never)]
     fn dist_calculator(&self, qr: Arc<dyn Array>, dist_q_c: f32) -> Self::DistanceCalculator<'_> {
         let codes = self.codes.values().as_primitive::<UInt8Type>().values();
-        let rotate_mat = self
-            .metadata
-            .rotate_mat
-            .as_ref()
-            .expect("RabitQ metadata not loaded");
-
-        let rotated_qr = match rotate_mat.value_type() {
-            DataType::Float16 => Self::rotate_query_vector::<Float16Type>(rotate_mat, &qr),
-            DataType::Float32 => Self::rotate_query_vector::<Float32Type>(rotate_mat, &qr),
-            DataType::Float64 => Self::rotate_query_vector::<Float64Type>(rotate_mat, &qr),
-            dt => unimplemented!("RabitQ does not support data type: {}", dt),
+        let rotated_qr = match self.metadata.input_space {
+            RabitInputSpace::Raw => {
+                let rotate_mat = self
+                    .metadata
+                    .rotate_mat
+                    .as_ref()
+                    .expect("RabitQ metadata not loaded");
+                match rotate_mat.value_type() {
+                    DataType::Float16 => Self::rotate_query_vector::<Float16Type>(rotate_mat, &qr),
+                    DataType::Float32 => Self::rotate_query_vector::<Float32Type>(rotate_mat, &qr),
+                    DataType::Float64 => Self::rotate_query_vector::<Float64Type>(rotate_mat, &qr),
+                    dt => unimplemented!("RabitQ does not support data type: {}", dt),
+                }
+            }
+            RabitInputSpace::Rotated => match qr.data_type() {
+                DataType::Float16 => Self::query_vector_to_f32::<Float16Type>(qr.as_ref()),
+                DataType::Float32 => Self::query_vector_to_f32::<Float32Type>(qr.as_ref()),
+                DataType::Float64 => Self::query_vector_to_f32::<Float64Type>(qr.as_ref()),
+                dt => unimplemented!("RabitQ does not support data type: {}", dt),
+            },
         };
 
         let dist_table = build_dist_table_direct::<Float32Type>(&rotated_qr);

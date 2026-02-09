@@ -173,6 +173,14 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch>;
 
+    /// Prepare query for IVF partition selection and partition search.
+    ///
+    /// Most indices can return the query unchanged. IVF_RQ overrides this to
+    /// rotate the query into the same space as stored IVF centroids.
+    fn prepare_query_for_partition_search(&self, query: &Query) -> Result<Query> {
+        Ok(query.clone())
+    }
+
     /// Find partitions that may contain nearest neighbors.
     ///
     /// If maximum_nprobes is set then this method will return the partitions

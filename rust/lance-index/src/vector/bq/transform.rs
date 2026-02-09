@@ -32,6 +32,63 @@ pub static SCALE_FACTORS_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(||
     arrow_schema::Field::new(SCALE_FACTORS_COLUMN, arrow_schema::DataType::Float32, true)
 });
 
+pub struct RotateTransformer {
+    rq: RabitQuantizer,
+    vector_column: String,
+}
+
+impl RotateTransformer {
+    pub fn new(rq: RabitQuantizer, vector_column: impl Into<String>) -> Self {
+        Self {
+            rq,
+            vector_column: vector_column.into(),
+        }
+    }
+}
+
+impl Debug for RotateTransformer {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RabitRotateTransformer(vector_column={})",
+            self.vector_column
+        )
+    }
+}
+
+impl Transformer for RotateTransformer {
+    #[instrument(name = "RabitRotateTransformer::transform", level = "debug", skip_all)]
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        if batch.column_by_name(RABIT_CODE_COLUMN).is_some() {
+            return Ok(batch.clone());
+        }
+        let vectors = batch
+            .column_by_name(&self.vector_column)
+            .ok_or(Error::Index {
+                message: format!(
+                    "RQ Rotate Transform: column {} not found in batch",
+                    self.vector_column
+                ),
+                location: location!(),
+            })?;
+        let vectors = vectors.as_fixed_size_list_opt().ok_or(Error::Index {
+            message: format!(
+                "RQ Rotate Transform: column {} is not a fixed size list, got {}",
+                self.vector_column,
+                vectors.data_type(),
+            ),
+            location: location!(),
+        })?;
+
+        let rotated = self.rq.rotate_fsl(vectors)?;
+        Ok(batch.replace_column_schema_by_name(
+            &self.vector_column,
+            rotated.data_type().clone(),
+            Arc::new(rotated),
+        )?)
+    }
+}
+
 pub struct RQTransformer {
     rq: RabitQuantizer,
     distance_type: DistanceType,

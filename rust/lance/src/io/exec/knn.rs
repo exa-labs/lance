@@ -508,6 +508,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                         let key = normalize_arrow(&query.key)?.0;
                         query.key = key;
                     };
+                    query = index.prepare_query_for_partition_search(&query)?;
 
                     metrics.partitions_ranked.add(index.total_partitions());
 
@@ -816,12 +817,6 @@ impl ANNIvfSubIndexExec {
                     let state = state.clone();
                     let index = index.clone();
                     async move {
-                        let mut query = query.clone();
-                        if index.metric_type() == DistanceType::Cosine {
-                            let key = normalize_arrow(&query.key)?.0;
-                            query.key = key;
-                        };
-
                         metrics.partitions_searched.add(1);
                         let batch = index
                             .search_in_partition(
@@ -874,12 +869,6 @@ impl ANNIvfSubIndexExec {
                 let pre_filter = prefilter.clone();
                 let state = state.clone();
                 async move {
-                    let mut query = query.clone();
-                    if index.metric_type() == DistanceType::Cosine {
-                        let key = normalize_arrow(&query.key)?.0;
-                        query.key = key;
-                    };
-
                     let batch = index
                         .search_in_partition(
                             part_id as usize,
@@ -1054,6 +1043,11 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         let raw_index = ds
                             .open_vector_index(&column, &index_uuid, &metrics.index_metrics)
                             .await?;
+                        if raw_index.metric_type() == DistanceType::Cosine {
+                            let key = normalize_arrow(&query.key)?.0;
+                            query.key = key;
+                        }
+                        query = raw_index.prepare_query_for_partition_search(&query)?;
 
                         let early_search = Self::initial_search(
                             raw_index.clone(),

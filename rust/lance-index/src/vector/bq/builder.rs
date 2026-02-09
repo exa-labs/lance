@@ -17,7 +17,8 @@ use rand_distr::Distribution;
 use snafu::location;
 
 use crate::vector::bq::storage::{
-    RabitQuantizationMetadata, RabitQuantizationStorage, RABIT_CODE_COLUMN, RABIT_METADATA_KEY,
+    RabitCentroidSpace, RabitInputSpace, RabitQuantizationMetadata, RabitQuantizationStorage,
+    RABIT_CODE_COLUMN, RABIT_METADATA_KEY,
 };
 use crate::vector::bq::transform::{ADD_FACTORS_FIELD, SCALE_FACTORS_FIELD};
 use crate::vector::bq::RQBuildParams;
@@ -69,12 +70,30 @@ impl RabitQuantizer {
             rotate_mat_position: 0,
             num_bits,
             packed: false,
+            input_space: RabitInputSpace::Raw,
+            centroid_space: RabitCentroidSpace::Raw,
         };
         Self { metadata }
     }
 
     pub fn num_bits(&self) -> u8 {
         self.metadata.num_bits
+    }
+
+    pub fn input_space(&self) -> RabitInputSpace {
+        self.metadata.input_space
+    }
+
+    pub fn set_input_space(&mut self, input_space: RabitInputSpace) {
+        self.metadata.input_space = input_space;
+    }
+
+    pub fn centroid_space(&self) -> RabitCentroidSpace {
+        self.metadata.centroid_space
+    }
+
+    pub fn set_centroid_space(&mut self, centroid_space: RabitCentroidSpace) {
+        self.metadata.centroid_space = centroid_space;
     }
 
     #[inline]
@@ -98,6 +117,125 @@ impl RabitQuantizer {
         self.code_dim() / self.metadata.num_bits as usize
     }
 
+    fn rotate_vectors<T: ArrowFloatType>(
+        &self,
+        vectors: &FixedSizeListArray,
+    ) -> Result<ndarray::Array2<T::Native>>
+    where
+        T::Native: AsPrimitive<f32>,
+    {
+        let n = vectors.len();
+        let dim = self.dim();
+        if vectors.value_length() as usize != dim {
+            return Err(Error::invalid_input(
+                format!(
+                    "Vector dimension mismatch: {} != {}",
+                    vectors.value_length(),
+                    dim
+                ),
+                location!(),
+            ));
+        }
+        let vectors = ndarray::ArrayView2::from_shape(
+            (n, dim),
+            vectors
+                .values()
+                .as_any()
+                .downcast_ref::<T::ArrayType>()
+                .unwrap()
+                .as_slice(),
+        )
+        .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+        let vectors = vectors.t();
+        let rotate_mat = self.rotate_mat::<T>();
+        let rotate_mat = rotate_mat.slice(s![.., 0..dim]);
+        let rotated = rotate_mat.dot(&vectors);
+        let rotated = rotated.t();
+        let values = rotated.iter().copied().collect();
+        Ok(
+            ndarray::Array2::from_shape_vec((n, self.code_dim()), values)
+                .expect("shape checked by construction"),
+        )
+    }
+
+    pub fn rotate_fsl(&self, vectors: &FixedSizeListArray) -> Result<FixedSizeListArray> {
+        let code_dim = self.code_dim();
+        match vectors.value_type() {
+            DataType::Float16 => {
+                let rotated = self.rotate_vectors::<Float16Type>(vectors)?;
+                let (values, offset) = rotated.into_raw_vec_and_offset();
+                debug_assert_eq!(offset, Some(0));
+                let values = <Float16Type as ArrowFloatType>::ArrayType::from_values(values);
+                Ok(FixedSizeListArray::try_new_from_values(
+                    values,
+                    code_dim as i32,
+                )?)
+            }
+            DataType::Float32 => {
+                let rotated = self.rotate_vectors::<Float32Type>(vectors)?;
+                let (values, offset) = rotated.into_raw_vec_and_offset();
+                debug_assert_eq!(offset, Some(0));
+                let values = <Float32Type as ArrowFloatType>::ArrayType::from_values(values);
+                Ok(FixedSizeListArray::try_new_from_values(
+                    values,
+                    code_dim as i32,
+                )?)
+            }
+            DataType::Float64 => {
+                let rotated = self.rotate_vectors::<Float64Type>(vectors)?;
+                let (values, offset) = rotated.into_raw_vec_and_offset();
+                debug_assert_eq!(offset, Some(0));
+                let values = <Float64Type as ArrowFloatType>::ArrayType::from_values(values);
+                Ok(FixedSizeListArray::try_new_from_values(
+                    values,
+                    code_dim as i32,
+                )?)
+            }
+            dt => Err(Error::invalid_input(
+                format!("Unsupported data type: {:?}", dt),
+                location!(),
+            )),
+        }
+    }
+
+    pub fn rotate_array(&self, query: &dyn Array) -> Result<ArrayRef> {
+        match query.data_type() {
+            DataType::Float16 => self.rotate_array_impl::<Float16Type>(query),
+            DataType::Float32 => self.rotate_array_impl::<Float32Type>(query),
+            DataType::Float64 => self.rotate_array_impl::<Float64Type>(query),
+            dt => Err(Error::invalid_input(
+                format!("Unsupported query data type: {:?}", dt),
+                location!(),
+            )),
+        }
+    }
+
+    fn rotate_array_impl<T: ArrowFloatType>(&self, query: &dyn Array) -> Result<ArrayRef>
+    where
+        T::Native: AsPrimitive<f32>,
+    {
+        let dim = self.dim();
+        if query.len() != dim {
+            return Err(Error::invalid_input(
+                format!("Query dimension mismatch: {} != {}", query.len(), dim),
+                location!(),
+            ));
+        }
+        let query = query
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .ok_or_else(|| Error::invalid_input("Query data type mismatch", location!()))?
+            .as_slice();
+        let rotate_mat = self.rotate_mat::<T>();
+        let rotate_mat = rotate_mat.slice(s![.., 0..dim]);
+        let query = ndarray::ArrayView1::from(query);
+        let rotated = rotate_mat.dot(&query);
+        let (values, offset) = rotated.into_raw_vec_and_offset();
+        debug_assert_eq!(offset, Some(0));
+        let values = <T::ArrayType as FloatArray<T>>::from_values(values);
+        Ok(Arc::new(values))
+    }
+
     // compute the dot product of v_q * v_r
     pub fn codes_res_dot_dists<T: ArrowFloatType>(
         &self,
@@ -107,34 +245,36 @@ impl RabitQuantizer {
         T::Native: AsPrimitive<f32>,
     {
         let dim = self.dim();
-        if residual_vectors.value_length() as usize != dim {
-            return Err(Error::invalid_input(
-                format!(
-                    "Vector dimension mismatch: {} != {}",
-                    residual_vectors.value_length(),
-                    dim
-                ),
-                location!(),
-            ));
-        }
+        let n = residual_vectors.len();
+        let code_dim = self.code_dim();
+        let rotated_vectors = match self.metadata.input_space {
+            RabitInputSpace::Raw => self.rotate_vectors::<T>(residual_vectors)?.reversed_axes(),
+            RabitInputSpace::Rotated => {
+                if residual_vectors.value_length() as usize != code_dim {
+                    return Err(Error::invalid_input(
+                        format!(
+                            "Vector dimension mismatch: {} != {}",
+                            residual_vectors.value_length(),
+                            code_dim
+                        ),
+                        location!(),
+                    ));
+                }
+                ndarray::ArrayView2::from_shape(
+                    (n, code_dim),
+                    residual_vectors
+                        .values()
+                        .as_any()
+                        .downcast_ref::<T::ArrayType>()
+                        .unwrap()
+                        .as_slice(),
+                )
+                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?
+                .to_owned()
+                .reversed_axes()
+            }
+        };
 
-        // convert the vector to a dxN matrix
-        let vec_mat = ndarray::ArrayView2::from_shape(
-            (residual_vectors.len(), dim),
-            residual_vectors
-                .values()
-                .as_any()
-                .downcast_ref::<T::ArrayType>()
-                .unwrap()
-                .as_slice(),
-        )
-        .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
-        let vec_mat = vec_mat.t();
-
-        let rotate_mat = self.rotate_mat::<T>();
-        // slice to (code_dim, dim)
-        let rotate_mat = rotate_mat.slice(s![.., 0..dim]);
-        let rotated_vectors = rotate_mat.dot(&vec_mat);
         let sqrt_dim = (dim as f32 * self.metadata.num_bits as f32).sqrt();
         let norm_dists = rotated_vectors.mapv(|v| v.as_().abs()).sum_axis(Axis(0)) / sqrt_dim;
         debug_assert_eq!(norm_dists.len(), residual_vectors.len());
@@ -151,25 +291,35 @@ impl RabitQuantizer {
         // we don't need to normalize the residual vectors,
         // because the sign of P^{-1} * v_r is the same as P^{-1} * v_r / ||v_r||
         let n = residual_vectors.len();
-        let dim = self.dim();
-        debug_assert_eq!(residual_vectors.values().len(), n * dim);
+        let code_dim = self.code_dim();
+        let rotated_vectors = match self.metadata.input_space {
+            RabitInputSpace::Raw => self.rotate_vectors::<T>(residual_vectors)?,
+            RabitInputSpace::Rotated => {
+                if residual_vectors.value_length() as usize != code_dim {
+                    return Err(Error::invalid_input(
+                        format!(
+                            "Vector dimension mismatch: {} != {}",
+                            residual_vectors.value_length(),
+                            code_dim
+                        ),
+                        location!(),
+                    ));
+                }
+                ndarray::ArrayView2::from_shape(
+                    (n, code_dim),
+                    residual_vectors
+                        .values()
+                        .as_any()
+                        .downcast_ref::<T::ArrayType>()
+                        .unwrap()
+                        .as_slice(),
+                )
+                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?
+                .to_owned()
+            }
+        };
 
-        let vectors = ndarray::ArrayView2::from_shape(
-            (n, dim),
-            residual_vectors
-                .values()
-                .as_any()
-                .downcast_ref::<T::ArrayType>()
-                .unwrap()
-                .as_slice(),
-        )
-        .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
-        let vectors = vectors.t();
-        let rotate_mat = self.rotate_mat::<T>();
-        let rotate_mat = rotate_mat.slice(s![.., 0..dim]);
-        let rotated_vectors = rotate_mat.dot(&vectors);
-
-        let quantized_vectors = rotated_vectors.t().mapv(|v| v.as_().is_sign_positive());
+        let quantized_vectors = rotated_vectors.mapv(|v| v.as_().is_sign_positive());
         let bv: BitVec<u8, Lsb0> = BitVec::from_iter(quantized_vectors);
 
         let codes = UInt8Array::from(bv.into_vec());
@@ -370,6 +520,8 @@ where
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+    use arrow::array::AsArray;
+    use arrow_array::Float32Array;
     use rstest::rstest;
 
     #[rstest]
@@ -409,5 +561,68 @@ mod tests {
         // Additional check: Q should have shape (m, m) and R should have shape (m, n)
         assert_eq!(q.dim(), (m, m));
         assert_eq!(r.dim(), (m, n));
+    }
+
+    #[test]
+    fn test_quantize_rotated_input_matches_raw_input() {
+        let dim = 8;
+        let quantizer = RabitQuantizer::new::<Float32Type>(1, dim);
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![
+                1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, -1.0, 2.0, -3.0, 4.0, -5.0, 6.0, -7.0,
+                8.0,
+            ]),
+            dim,
+        )
+        .unwrap();
+
+        let raw_codes = quantizer.quantize(&vectors).unwrap();
+        let rotated_vectors = quantizer.rotate_fsl(&vectors).unwrap();
+
+        let mut rotated_quantizer = quantizer.clone();
+        rotated_quantizer.set_input_space(RabitInputSpace::Rotated);
+        let rotated_codes = rotated_quantizer.quantize(&rotated_vectors).unwrap();
+
+        assert_eq!(
+            raw_codes
+                .as_fixed_size_list()
+                .values()
+                .as_primitive::<arrow_array::types::UInt8Type>()
+                .values(),
+            rotated_codes
+                .as_fixed_size_list()
+                .values()
+                .as_primitive::<arrow_array::types::UInt8Type>()
+                .values()
+        );
+    }
+
+    #[test]
+    fn test_codes_res_dot_dists_rotated_input_matches_raw_input() {
+        let dim = 8;
+        let quantizer = RabitQuantizer::new::<Float32Type>(1, dim);
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![
+                1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, -1.0, 2.0, -3.0, 4.0, -5.0, 6.0, -7.0,
+                8.0,
+            ]),
+            dim,
+        )
+        .unwrap();
+
+        let raw = quantizer
+            .codes_res_dot_dists::<Float32Type>(&vectors)
+            .unwrap();
+        let rotated_vectors = quantizer.rotate_fsl(&vectors).unwrap();
+        let mut rotated_quantizer = quantizer.clone();
+        rotated_quantizer.set_input_space(RabitInputSpace::Rotated);
+        let rotated = rotated_quantizer
+            .codes_res_dot_dists::<Float32Type>(&rotated_vectors)
+            .unwrap();
+
+        assert_eq!(raw.len(), rotated.len());
+        raw.iter().zip(rotated.iter()).for_each(|(lhs, rhs)| {
+            assert_relative_eq!(lhs, rhs, epsilon = 1e-5);
+        });
     }
 }

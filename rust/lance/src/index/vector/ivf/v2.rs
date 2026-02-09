@@ -28,6 +28,7 @@ use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector};
+use lance_index::vector::bq::storage::RabitCentroidSpace;
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
@@ -450,6 +451,24 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         _metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         unimplemented!("IVFIndex not currently used as sub-index and top-level indices do partition-aware search")
+    }
+
+    fn prepare_query_for_partition_search(&self, query: &Query) -> Result<Query> {
+        if Q::quantization_type() != QuantizationType::Rabit {
+            return Ok(query.clone());
+        }
+
+        let Quantizer::Rabit(rabit_quantizer) = self.storage.quantizer()? else {
+            return Ok(query.clone());
+        };
+
+        if rabit_quantizer.centroid_space() != RabitCentroidSpace::Rotated {
+            return Ok(query.clone());
+        }
+
+        let mut query = query.clone();
+        query.key = rabit_quantizer.rotate_array(query.key.as_ref())?;
+        Ok(query)
     }
 
     fn find_partitions(&self, query: &Query) -> Result<(UInt32Array, Float32Array)> {
