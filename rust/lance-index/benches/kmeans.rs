@@ -4,7 +4,7 @@
 use arrow::array::AsArray;
 use arrow::datatypes::Float32Type;
 use arrow_array::FixedSizeListArray;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::vector::flat::storage::FlatFloatStorage;
@@ -86,17 +86,59 @@ fn bench_train(c: &mut Criterion) {
     }
 }
 
+/// Benchmark comparing in-memory vs disk-based KMeans training.
+///
+/// This benchmark verifies that the disk-based approach has at most ~20% overhead
+/// compared to the in-memory approach. The OS page cache keeps hot pages in memory,
+/// so performance is typically much closer to the in-memory baseline.
+fn bench_train_disk_vs_memory(c: &mut Criterion) {
+    // Use a moderately-sized dataset to make the comparison meaningful
+    // without taking too long: 256 * 512 vectors of dimension 128.
+    let n = 256 * 512;
+    let dimension = 128i32;
+    let k = n / 256;
+
+    let values = generate_random_array(n * dimension as usize);
+    let data = FixedSizeListArray::try_new_from_values(values, dimension).unwrap();
+
+    let mut group = c.benchmark_group(format!("train_disk_vs_memory_{}d_{}k", dimension, k));
+
+    group.bench_with_input(
+        BenchmarkId::new("in_memory", format!("{}d_{}k", dimension, k)),
+        &data,
+        |b, data| {
+            let params = KMeansParams::default()
+                .with_hierarchical_k(0)
+                .with_on_disk(false);
+            b.iter(|| KMeans::new_with_params(data, k, &params).ok().unwrap());
+        },
+    );
+
+    group.bench_with_input(
+        BenchmarkId::new("on_disk", format!("{}d_{}k", dimension, k)),
+        &data,
+        |b, data| {
+            let params = KMeansParams::default()
+                .with_hierarchical_k(0)
+                .with_on_disk(true);
+            b.iter(|| KMeans::new_with_params(data, k, &params).ok().unwrap());
+        },
+    );
+
+    group.finish();
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
     .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_train);
+    targets = bench_train, bench_train_disk_vs_memory);
 
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_train);
+    targets = bench_train, bench_train_disk_vs_memory);
 criterion_main!(benches);

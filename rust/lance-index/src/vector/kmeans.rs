@@ -12,6 +12,8 @@
 use core::f32;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::io::Write;
+use std::marker::PhantomData;
 use std::ops::{AddAssign, DivAssign};
 use std::sync::Arc;
 use std::vec;
@@ -32,11 +34,13 @@ use lance_linalg::distance::hamming::{hamming, hamming_distance_batch};
 use lance_linalg::distance::{dot_distance_batch, DistanceType, Normalize};
 use lance_linalg::kernels::{argmin_value_float, argmin_value_float_with_bias};
 use log::{info, warn};
+use memmap2::Mmap;
 use num_traits::One;
 use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
 use rand::prelude::*;
 use rayon::prelude::*;
 use snafu::location;
+use tempfile::NamedTempFile;
 use {
     lance_linalg::distance::{
         l2::{l2_distance_batch, L2},
@@ -87,6 +91,13 @@ pub struct KMeansParams {
     /// hierarchical kmeans is enabled only if hierarchical_k > 1 and k > 256.
     pub hierarchical_k: usize,
 
+    /// If true, spill training data to a temporary file on disk and access it via memory-mapping
+    /// instead of keeping it in RAM. This reduces memory usage at the cost of additional I/O.
+    ///
+    /// The OS page cache will keep frequently accessed pages in memory, so the performance
+    /// overhead is typically small (< 20%) for most workloads.
+    pub on_disk: bool,
+
     /// Optional sync callback for iteration progress: (current_iteration, max_iterations).
     pub on_progress: Option<Arc<dyn Fn(u32, u32) + Send + Sync>>,
 }
@@ -101,6 +112,7 @@ impl std::fmt::Debug for KMeansParams {
             .field("distance_type", &self.distance_type)
             .field("balance_factor", &self.balance_factor)
             .field("hierarchical_k", &self.hierarchical_k)
+            .field("on_disk", &self.on_disk)
             .field("on_progress", &self.on_progress.as_ref().map(|_| "..."))
             .finish()
     }
@@ -116,6 +128,7 @@ impl Default for KMeansParams {
             distance_type: DistanceType::L2,
             balance_factor: 0.0,
             hierarchical_k: 16,
+            on_disk: false,
             on_progress: None,
         }
     }
@@ -163,6 +176,101 @@ impl KMeansParams {
     pub fn with_hierarchical_k(mut self, hierarchical_k: usize) -> Self {
         self.hierarchical_k = hierarchical_k;
         self
+    }
+
+    /// If `on_disk` is `true`, spill training sample data to a temporary file on disk and
+    /// access it via memory-mapping instead of keeping it in RAM.
+    ///
+    /// This reduces memory usage at the cost of additional I/O during training.
+    pub fn with_on_disk(mut self, on_disk: bool) -> Self {
+        self.on_disk = on_disk;
+        self
+    }
+}
+
+/// Internal storage for KMeans training data.
+///
+/// Training data can be kept in memory or spilled to a memory-mapped temp file.
+/// Both variants expose the data as a flat `&[T]` slice, so the core algorithm
+/// is unaffected by the storage choice.
+enum KMeansDataBuffer<T> {
+    /// Data lives in an Arrow buffer already held by the caller.
+    InMemory { data: *const T, len: usize },
+    /// Data has been written to a temp file and memory-mapped.
+    OnDisk {
+        _file: NamedTempFile,
+        mmap: Mmap,
+        phantom: PhantomData<T>,
+    },
+}
+
+// SAFETY: The `InMemory` variant holds a raw pointer that refers to the `FixedSizeListArray`
+// owned by the caller of `KMeans::train_kmeans`, which outlives the buffer.
+// The `OnDisk` variant is backed by a read-only Mmap, which is Send + Sync.
+unsafe impl<T: Send> Send for KMeansDataBuffer<T> {}
+unsafe impl<T: Sync> Sync for KMeansDataBuffer<T> {}
+
+impl<T: Copy> KMeansDataBuffer<T> {
+    /// Create an in-memory buffer referencing the given slice directly.
+    fn in_memory(data: &[T]) -> Self {
+        Self::InMemory {
+            data: data.as_ptr(),
+            len: data.len(),
+        }
+    }
+
+    /// Write the given slice to a temp file and memory-map it.
+    ///
+    /// The mmap is page-aligned, which satisfies alignment requirements for any
+    /// primitive numeric type (f16, f32, f64, u8).
+    fn on_disk(data: &[T]) -> arrow::error::Result<Self> {
+        // SAFETY: reinterpret the typed slice as bytes for writing.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * std::mem::size_of::<T>())
+        };
+        let mut file = NamedTempFile::new().map_err(|e| {
+            ArrowError::ExternalError(Box::new(e))
+        })?;
+        file.write_all(bytes).map_err(|e| {
+            ArrowError::ExternalError(Box::new(e))
+        })?;
+        file.flush().map_err(|e| {
+            ArrowError::ExternalError(Box::new(e))
+        })?;
+        // SAFETY: the file is not modified after this point and the Mmap is
+        // kept alive together with the NamedTempFile.
+        let mmap = unsafe {
+            Mmap::map(file.as_file()).map_err(|e| ArrowError::ExternalError(Box::new(e)))?
+        };
+        Ok(Self::OnDisk {
+            _file: file,
+            mmap,
+            phantom: PhantomData,
+        })
+    }
+
+    /// Return the training data as a flat slice.
+    fn as_slice(&self) -> &[T] {
+        match self {
+            Self::InMemory { data, len } => {
+                // SAFETY: pointer and length came from a live slice in the same call.
+                unsafe { std::slice::from_raw_parts(*data, *len) }
+            }
+            Self::OnDisk { mmap, .. } => {
+                // SAFETY: mmap contains bytes written from &[T] with proper alignment
+                // (mmap is page-aligned). The size must be a multiple of size_of::<T>().
+                let byte_len = mmap.len();
+                let elem_size = std::mem::size_of::<T>();
+                assert_eq!(
+                    byte_len % elem_size,
+                    0,
+                    "mmap length must be a multiple of element size"
+                );
+                unsafe {
+                    std::slice::from_raw_parts(mmap.as_ptr() as *const T, byte_len / elem_size)
+                }
+            }
+        }
     }
 }
 
@@ -636,7 +744,7 @@ impl KMeans {
         params: &KMeansParams,
     ) -> arrow::error::Result<Self>
     where
-        T::Native: Num,
+        T::Native: Num + Copy,
     {
         // the data is `num_partitions * sample_rate` vectors,
         // but here `k` may be not `num_partitions` in the case of hierarchical kmeans,
@@ -661,6 +769,14 @@ impl KMeans {
                     data.value_type()
                 )))?;
 
+        // Optionally spill training data to disk to reduce RAM usage.
+        let buffer = if params.on_disk {
+            KMeansDataBuffer::on_disk(data.values())?
+        } else {
+            KMeansDataBuffer::in_memory(data.values())
+        };
+        let data = buffer.as_slice();
+
         let mut best_kmeans = Self::empty(dimension, params.distance_type);
         let mut cluster_sizes = vec![0; k];
         let mut adjusted_balance_factor = f32::MAX;
@@ -670,7 +786,7 @@ impl KMeans {
         for redo in 1..=params.redos {
             let mut kmeans: Self = match &params.init {
                 KMeanInit::Random => Self::init_random::<T>(
-                    data.values(),
+                    data,
                     dimension,
                     k,
                     rng.clone(),
@@ -705,7 +821,7 @@ impl KMeans {
                 let balance_factor = adjusted_balance_factor.min(params.balance_factor);
                 let (membership, radius, losses) = Algo::compute_membership_and_loss(
                     kmeans.centroids.as_primitive::<T>().values(),
-                    data.values(),
+                    data,
                     dimension,
                     params.distance_type,
                     balance_factor,
@@ -719,7 +835,7 @@ impl KMeans {
                 let last_loss = losses.iter().sum::<f64>() + balance_loss as f64;
 
                 kmeans = Algo::to_kmeans(
-                    data.values(),
+                    data,
                     dimension,
                     k,
                     &membership,

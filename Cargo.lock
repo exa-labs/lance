@@ -5133,6 +5133,7 @@ dependencies = [
  "lindera",
  "lindera-tantivy",
  "log",
+ "memmap2",
  "ndarray",
  "num-traits",
  "object_store",
