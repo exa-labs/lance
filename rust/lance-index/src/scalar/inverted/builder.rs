@@ -24,7 +24,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::{ARROW_EXT_NAME_KEY, iter_str_array};
 use lance_core::cache::LanceCache;
-use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_core::{error::LanceOptionExt, utils::tempfile::TempDir};
 use lance_io::object_store::ObjectStore;
@@ -533,11 +533,9 @@ impl InnerBuilder {
         docs: Arc<DocSet>,
     ) -> Result<()> {
         let id = self.id;
+        let schema = inverted_list_schema(self.with_position);
         let mut writer = store
-            .new_index_file(
-                &posting_file_path(self.id),
-                inverted_list_schema(self.with_position),
-            )
+            .new_index_file(&posting_file_path(self.id), schema.clone())
             .await?;
         let posting_lists = std::mem::take(&mut self.posting_lists);
 
@@ -547,34 +545,14 @@ impl InnerBuilder {
             id,
             self.with_position
         );
-        let schema = inverted_list_schema(self.with_position);
-        let docs_for_batches = docs.clone();
-        let schema_for_batches = schema.clone();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let producer = spawn_cpu(move || {
-            for posting_list in posting_lists {
-                let batch = posting_list
-                    .to_batch_with_docs(&docs_for_batches, schema_for_batches.clone())?;
-                if let Err(err) = tx.send(batch) {
-                    return Err(Error::execution(format!(
-                        "failed to send posting list batch to writer: {err}"
-                    )));
-                }
-            }
-            Result::Ok(())
-        });
 
         let mut write_duration = std::time::Duration::ZERO;
         let mut num_posting_lists = 0;
-        while let Some(batch) = rx.recv().await {
+        for posting_list in posting_lists {
             num_posting_lists += 1;
+            let batch = posting_list.to_batch_with_docs(&docs, schema.clone())?;
             let start = std::time::Instant::now();
-            if let Err(err) = writer.write_record_batch(batch).await {
-                drop(rx);
-                // Wait for producer to stop; preserve the write error as the primary failure.
-                let _ = producer.await;
-                return Err(err);
-            }
+            writer.write_record_batch(batch).await?;
             write_duration += start.elapsed();
 
             if num_posting_lists % 500_000 == 0 {
@@ -586,8 +564,6 @@ impl InnerBuilder {
                 );
             }
         }
-        drop(rx);
-        producer.await?;
 
         writer.finish().await?;
         Ok(())
