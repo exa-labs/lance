@@ -623,6 +623,11 @@ pub struct FragReadConfig {
     pub reader_priority: Option<u32>,
     /// File reader options to use when reading data files.
     pub file_reader_options: Option<FileReaderOptions>,
+    /// If true, returns all physical rows with data columns unchanged — only
+    /// `_rowid` is nulled for deleted rows. The deletion vector is not applied,
+    /// so no rows are removed from the batch.
+    /// If false (default), the DV is applied and deleted rows are filtered out.
+    pub make_deletions_null: bool,
 }
 
 impl FragReadConfig {
@@ -903,6 +908,9 @@ impl FileFragment {
         }
         if read_config.with_row_created_at_version {
             reader.with_row_created_at_version();
+        }
+        if read_config.make_deletions_null {
+            reader.with_make_deletions_null();
         }
 
         Ok(reader)
