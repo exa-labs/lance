@@ -9,7 +9,6 @@ description = "Arrow scalar type with Ord, Hash, and Eq support"
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
-readme = "README.md"
 
 [dependencies]
 # Note: this is a core crate and we should aim to keep this dependency list
