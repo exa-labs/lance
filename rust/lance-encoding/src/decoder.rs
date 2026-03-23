@@ -2012,6 +2012,7 @@ fn create_scheduler_decoder(
     )?;
 
     let scheduler_handle = tokio::task::spawn(async move {
+        let sched_start = std::time::Instant::now();
         let mut decode_scheduler = match DecodeBatchScheduler::try_new(
             target_schema.as_ref(),
             &column_indices,
@@ -2032,7 +2033,9 @@ fn create_scheduler_decoder(
                 return;
             }
         };
+        let sched_create_us = sched_start.elapsed().as_micros() as u64;
 
+        let schedule_start = std::time::Instant::now();
         match requested_rows {
             RequestedRows::Ranges(ranges) => {
                 decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
@@ -2040,6 +2043,23 @@ fn create_scheduler_decoder(
             RequestedRows::Indices(indices) => {
                 decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
             }
+        }
+        let schedule_us = schedule_start.elapsed().as_micros() as u64;
+
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SCHED_CREATE_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+        static SCHED_SCHEDULE_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+        static SCHED_COUNT: AtomicU64 = AtomicU64::new(0);
+        SCHED_CREATE_TOTAL_US.fetch_add(sched_create_us, Ordering::Relaxed);
+        SCHED_SCHEDULE_TOTAL_US.fetch_add(schedule_us, Ordering::Relaxed);
+        let count = SCHED_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if count % 500 == 0 {
+            eprintln!(
+                "[lance-sched-perf] schedulers={} create_total_ms={} schedule_total_ms={}",
+                count,
+                SCHED_CREATE_TOTAL_US.load(Ordering::Relaxed) / 1000,
+                SCHED_SCHEDULE_TOTAL_US.load(Ordering::Relaxed) / 1000,
+            );
         }
     });
 

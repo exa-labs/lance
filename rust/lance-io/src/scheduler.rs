@@ -32,6 +32,22 @@ const BACKPRESSURE_DEBOUNCE: u64 = 60;
 static IOPS_COUNTER: AtomicU64 = AtomicU64::new(0);
 // Global counter of how many bytes were read by the scheduler
 static BYTES_READ_COUNTER: AtomicU64 = AtomicU64::new(0);
+// Global counter of how many S3 requests were submitted (for profiling)
+static S3_REQUESTS_COUNTER: AtomicU64 = AtomicU64::new(0);
+static S3_IOPS_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub fn s3_requests_counter() -> u64 {
+    S3_REQUESTS_COUNTER.load(Ordering::Acquire)
+}
+
+pub fn s3_iops_counter() -> u64 {
+    S3_IOPS_COUNTER.load(Ordering::Acquire)
+}
+
+pub fn reset_s3_counters() {
+    S3_REQUESTS_COUNTER.store(0, Ordering::Release);
+    S3_IOPS_COUNTER.store(0, Ordering::Release);
+}
 // By default, we limit the number of IOPS across the entire process to 128
 //
 // In theory this is enough for ~10GBps on S3 following the guidelines to issue
@@ -844,6 +860,8 @@ impl ScanScheduler {
         request: Vec<Range<u64>>,
         priority: u128,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
+        S3_REQUESTS_COUNTER.fetch_add(1, Ordering::Relaxed);
+        S3_IOPS_COUNTER.fetch_add(request.len() as u64, Ordering::Relaxed);
         match &self.io_queue {
             IoQueueType::Standard(io_queue) => futures::future::Either::Left(
                 self.submit_request_standard(reader, request, priority, io_queue),
