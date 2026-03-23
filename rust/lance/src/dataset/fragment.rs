@@ -937,8 +937,10 @@ impl FileFragment {
             use std::sync::atomic::{AtomicBool, Ordering as AtomOrd};
             static LOGGED_V1: AtomicBool = AtomicBool::new(false);
             if !LOGGED_V1.swap(true, AtomOrd::Relaxed) {
-                eprintln!("[lance-format] data_file uses V1 (legacy) format: version={}.{} path={}",
-                    data_file.file_major_version, data_file.file_minor_version, data_file.path);
+                eprintln!(
+                    "[lance-format] data_file uses V1 (legacy) format: version={}.{} path={}",
+                    data_file.file_major_version, data_file.file_minor_version, data_file.path
+                );
             }
             let max_field_id = data_file.fields.iter().max().unwrap();
             if !schema_per_file.fields.is_empty() {
@@ -974,8 +976,10 @@ impl FileFragment {
                 use std::sync::atomic::{AtomicBool, Ordering as AtomOrd};
                 static LOGGED_V2: AtomicBool = AtomicBool::new(false);
                 if !LOGGED_V2.swap(true, AtomOrd::Relaxed) {
-                    eprintln!("[lance-format] data_file uses V2 format: version={}.{} path={}",
-                        data_file.file_major_version, data_file.file_minor_version, data_file.path);
+                    eprintln!(
+                        "[lance-format] data_file uses V2 format: version={}.{} path={}",
+                        data_file.file_major_version, data_file.file_minor_version, data_file.path
+                    );
                 }
             }
             let path = self
