@@ -35,6 +35,7 @@ static BYTES_READ_COUNTER: AtomicU64 = AtomicU64::new(0);
 // Global counter of how many S3 requests were submitted (for profiling)
 static S3_REQUESTS_COUNTER: AtomicU64 = AtomicU64::new(0);
 static S3_IOPS_COUNTER: AtomicU64 = AtomicU64::new(0);
+static S3_BYTES_REQUESTED: AtomicU64 = AtomicU64::new(0);
 
 pub fn s3_requests_counter() -> u64 {
     S3_REQUESTS_COUNTER.load(Ordering::Acquire)
@@ -44,9 +45,14 @@ pub fn s3_iops_counter() -> u64 {
     S3_IOPS_COUNTER.load(Ordering::Acquire)
 }
 
+pub fn s3_bytes_requested() -> u64 {
+    S3_BYTES_REQUESTED.load(Ordering::Acquire)
+}
+
 pub fn reset_s3_counters() {
     S3_REQUESTS_COUNTER.store(0, Ordering::Release);
     S3_IOPS_COUNTER.store(0, Ordering::Release);
+    S3_BYTES_REQUESTED.store(0, Ordering::Release);
 }
 // By default, we limit the number of IOPS across the entire process to 128
 //
@@ -862,6 +868,8 @@ impl ScanScheduler {
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         S3_REQUESTS_COUNTER.fetch_add(1, Ordering::Relaxed);
         S3_IOPS_COUNTER.fetch_add(request.len() as u64, Ordering::Relaxed);
+        let total_bytes: u64 = request.iter().map(|r| r.end - r.start).sum();
+        S3_BYTES_REQUESTED.fetch_add(total_bytes, Ordering::Relaxed);
         match &self.io_queue {
             IoQueueType::Standard(io_queue) => futures::future::Either::Left(
                 self.submit_request_standard(reader, request, priority, io_queue),
