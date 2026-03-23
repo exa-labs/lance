@@ -31,11 +31,11 @@ use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
 use lance_index::{DatasetIndexExt, IndexType};
+use dashmap::DashMap;
 use lance_io::object_store::{
     LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
     StorageOptionsAccessor, StorageOptionsProvider,
 };
-use dashmap::DashMap;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::{read_last_block, read_message, read_metadata_offset, read_struct};
 use lance_namespace::LanceNamespace;
