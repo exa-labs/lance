@@ -985,10 +985,7 @@ impl FileFragment {
             } else {
                 // Reuse the dataset's shared scan scheduler to avoid creating
                 // new HTTP connection pools per fragment read.
-                (
-                    self.dataset.scan_scheduler.clone(),
-                    0,
-                )
+                (self.dataset.scan_scheduler.clone(), 0)
             };
             let file_scheduler = store_scheduler
                 .open_file_with_priority(&path, reader_priority as u64, &data_file.file_size_bytes)
