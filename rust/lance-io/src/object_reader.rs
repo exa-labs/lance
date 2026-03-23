@@ -3,6 +3,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use deepsize::DeepSizeOf;
@@ -16,6 +17,23 @@ use tokio::sync::OnceCell;
 use tracing::instrument;
 
 use crate::{object_store::DEFAULT_CLOUD_IO_PARALLELISM, traits::Reader};
+
+// Global counters for V1 (CloudObjectReader) S3 calls
+static V1_S3_CALLS: AtomicU64 = AtomicU64::new(0);
+static V1_S3_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub fn v1_s3_calls() -> u64 {
+    V1_S3_CALLS.load(Ordering::Acquire)
+}
+
+pub fn v1_s3_bytes() -> u64 {
+    V1_S3_BYTES.load(Ordering::Acquire)
+}
+
+pub fn reset_v1_s3_counters() {
+    V1_S3_CALLS.store(0, Ordering::Release);
+    V1_S3_BYTES.store(0, Ordering::Release);
+}
 
 trait StaticGetRange {
     fn path(&self) -> &Path;
@@ -176,6 +194,8 @@ impl Reader for CloudObjectReader {
 
     #[instrument(level = "debug", skip(self))]
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
+        V1_S3_CALLS.fetch_add(1, Ordering::Relaxed);
+        V1_S3_BYTES.fetch_add((range.end - range.start) as u64, Ordering::Relaxed);
         let get_request = Arc::new(GetRequest {
             object_store: self.object_store.clone(),
             path: self.path.clone(),
