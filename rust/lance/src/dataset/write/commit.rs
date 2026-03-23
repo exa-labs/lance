@@ -4,9 +4,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use lance_core::utils::mask::RowAddrTreeMap;
 use lance_file::version::LanceFileVersion;
-use dashmap::DashMap;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::{
