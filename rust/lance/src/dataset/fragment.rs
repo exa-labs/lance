@@ -983,11 +983,10 @@ impl FileFragment {
                     read_config.reader_priority.unwrap_or(0),
                 )
             } else {
+                // Reuse the dataset's shared scan scheduler to avoid creating
+                // new HTTP connection pools per fragment read.
                 (
-                    ScanScheduler::new(
-                        self.dataset.object_store.clone(),
-                        SchedulerConfig::max_bandwidth(&self.dataset.object_store),
-                    ),
+                    self.dataset.scan_scheduler.clone(),
                     0,
                 )
             };

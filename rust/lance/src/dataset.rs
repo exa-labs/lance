@@ -35,6 +35,7 @@ use lance_io::object_store::{
     LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
     StorageOptionsAccessor, StorageOptionsProvider,
 };
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::{read_last_block, read_message, read_metadata_offset, read_struct};
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
@@ -175,6 +176,11 @@ pub struct Dataset {
     /// Object store parameters used when opening this dataset.
     /// These are used when creating object stores for additional base paths.
     pub(crate) store_params: Option<Box<ObjectStoreParams>>,
+
+    /// Shared scan scheduler for reading data files.
+    /// Created once per dataset and reused across all fragment reads to avoid
+    /// creating new HTTP connection pools per read.
+    pub scan_scheduler: Arc<ScanScheduler>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -706,6 +712,10 @@ impl Dataset {
         let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
         let index_cache = Arc::new(session.index_cache.for_dataset(&uri));
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
+        let scan_scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
         Ok(Self {
             object_store,
             base: base_path,
@@ -720,6 +730,7 @@ impl Dataset {
             index_cache,
             file_reader_options,
             store_params: store_params.map(Box::new),
+            scan_scheduler,
         })
     }
 
@@ -1561,6 +1572,11 @@ impl Dataset {
         store_params: Option<ObjectStoreParams>,
     ) -> Self {
         let mut cloned = self.clone();
+        // Create a new scan scheduler for the new object store
+        cloned.scan_scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
         cloned.object_store = object_store;
         if let Some(store_params) = store_params {
             cloned.store_params = Some(Box::new(store_params));
