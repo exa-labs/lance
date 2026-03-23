@@ -29,6 +29,7 @@ use lance_core::utils::tracing::{
 };
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
+use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
 use lance_index::{DatasetIndexExt, IndexType};
@@ -186,6 +187,11 @@ pub struct Dataset {
     /// Cache of opened FileScheduler instances, keyed by file path.
     /// Avoids re-opening S3 file handles for the same data file across requests.
     pub file_scheduler_cache: Arc<DashMap<Path, FileScheduler>>,
+
+    /// Cache of opened V1 (legacy) FileReader instances, keyed by file path.
+    /// Avoids re-creating PreviousFileReader objects (and their S3 metadata reads)
+    /// for the same data file across requests.
+    pub v1_reader_cache: Arc<DashMap<Path, PreviousFileReader>>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -738,6 +744,7 @@ impl Dataset {
             store_params: store_params.map(Box::new),
             scan_scheduler,
             file_scheduler_cache,
+            v1_reader_cache: Arc::new(DashMap::new()),
         })
     }
 

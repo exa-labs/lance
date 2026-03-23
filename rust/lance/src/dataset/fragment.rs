@@ -949,16 +949,26 @@ impl FileFragment {
                     .data_file_dir(data_file)?
                     .child(data_file.path.as_str());
                 let field_id_offset = Self::get_field_id_offset(data_file);
-                let reader = PreviousFileReader::try_new_with_fragment_id(
-                    &self.dataset.object_store,
-                    &path,
-                    self.schema().clone(),
-                    self.id() as u32,
-                    field_id_offset as i32,
-                    *max_field_id,
-                    Some(&self.dataset.metadata_cache.file_metadata_cache(&path)),
-                )
-                .await?;
+
+                // Try to get a cached V1 reader first (avoids re-opening S3 file
+                // handles and re-reading metadata/page tables on every request)
+                let reader = if let Some(cached) = self.dataset.v1_reader_cache.get(&path) {
+                    cached.clone()
+                } else {
+                    let new_reader = PreviousFileReader::try_new_with_fragment_id(
+                        &self.dataset.object_store,
+                        &path,
+                        self.schema().clone(),
+                        self.id() as u32,
+                        field_id_offset as i32,
+                        *max_field_id,
+                        Some(&self.dataset.metadata_cache.file_metadata_cache(&path)),
+                    )
+                    .await?;
+                    self.dataset.v1_reader_cache.insert(path.clone(), new_reader.clone());
+                    new_reader
+                };
+
                 let initialized_schema = reader.schema().project_by_schema(
                     schema_per_file.as_ref(),
                     OnMissing::Error,
