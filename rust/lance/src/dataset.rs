@@ -35,7 +35,8 @@ use lance_io::object_store::{
     LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
     StorageOptionsAccessor, StorageOptionsProvider,
 };
-use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use dashmap::DashMap;
+use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::{read_last_block, read_message, read_metadata_offset, read_struct};
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
@@ -181,6 +182,10 @@ pub struct Dataset {
     /// Created once per dataset and reused across all fragment reads to avoid
     /// creating new HTTP connection pools per read.
     pub scan_scheduler: Arc<ScanScheduler>,
+
+    /// Cache of opened FileScheduler instances, keyed by file path.
+    /// Avoids re-opening S3 file handles for the same data file across requests.
+    pub file_scheduler_cache: Arc<DashMap<Path, FileScheduler>>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -716,6 +721,7 @@ impl Dataset {
             object_store.clone(),
             SchedulerConfig::max_bandwidth(&object_store),
         );
+        let file_scheduler_cache = Arc::new(DashMap::new());
         Ok(Self {
             object_store,
             base: base_path,
@@ -731,6 +737,7 @@ impl Dataset {
             file_reader_options,
             store_params: store_params.map(Box::new),
             scan_scheduler,
+            file_scheduler_cache,
         })
     }
 
@@ -1577,6 +1584,8 @@ impl Dataset {
             object_store.clone(),
             SchedulerConfig::max_bandwidth(&object_store),
         );
+        // Clear the file scheduler cache since it's tied to the old object store
+        cloned.file_scheduler_cache = Arc::new(DashMap::new());
         cloned.object_store = object_store;
         if let Some(store_params) = store_params {
             cloned.store_params = Some(Box::new(store_params));

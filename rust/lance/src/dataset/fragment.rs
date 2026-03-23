@@ -987,9 +987,35 @@ impl FileFragment {
                 // new HTTP connection pools per fragment read.
                 (self.dataset.scan_scheduler.clone(), 0)
             };
-            let file_scheduler = store_scheduler
-                .open_file_with_priority(&path, reader_priority as u64, &data_file.file_size_bytes)
-                .await?;
+            // Check the dataset's file scheduler cache first to avoid
+            // re-opening S3 file handles for the same data file across requests.
+            let file_scheduler = if data_file.base_id.is_none()
+                && read_config.scan_scheduler.is_none()
+            {
+                if let Some(cached) = self.dataset.file_scheduler_cache.get(&path) {
+                    cached.value().clone()
+                } else {
+                    let scheduler = store_scheduler
+                        .open_file_with_priority(
+                            &path,
+                            reader_priority as u64,
+                            &data_file.file_size_bytes,
+                        )
+                        .await?;
+                    self.dataset
+                        .file_scheduler_cache
+                        .insert(path.clone(), scheduler.clone());
+                    scheduler
+                }
+            } else {
+                store_scheduler
+                    .open_file_with_priority(
+                        &path,
+                        reader_priority as u64,
+                        &data_file.file_size_bytes,
+                    )
+                    .await?
+            };
             let file_metadata = self.get_file_metadata(&file_scheduler).await?;
             let path = file_scheduler.reader().path().clone();
             let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);

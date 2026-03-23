@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use lance_core::utils::mask::RowAddrTreeMap;
 use lance_file::version::LanceFileVersion;
+use dashmap::DashMap;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::{
@@ -393,6 +394,7 @@ impl<'a> CommitBuilder<'a> {
                     object_store.clone(),
                     SchedulerConfig::max_bandwidth(&object_store),
                 );
+                let file_scheduler_cache = Arc::new(DashMap::new());
 
                 Ok(Dataset {
                     object_store,
@@ -409,6 +411,7 @@ impl<'a> CommitBuilder<'a> {
                     file_reader_options: None,
                     store_params: self.store_params.clone().map(Box::new),
                     scan_scheduler,
+                    file_scheduler_cache,
                 })
             }
         }
