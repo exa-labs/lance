@@ -395,6 +395,7 @@ impl<'a> CommitBuilder<'a> {
                     SchedulerConfig::max_bandwidth(&object_store),
                 );
                 let file_scheduler_cache = Arc::new(DashMap::new());
+                let v1_reader_cache = Arc::new(DashMap::new());
 
                 Ok(Dataset {
                     object_store,
@@ -412,6 +413,7 @@ impl<'a> CommitBuilder<'a> {
                     store_params: self.store_params.clone().map(Box::new),
                     scan_scheduler,
                     file_scheduler_cache,
+                    v1_reader_cache,
                 })
             }
         }
