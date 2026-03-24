@@ -965,7 +965,9 @@ impl FileFragment {
                         Some(&self.dataset.metadata_cache.file_metadata_cache(&path)),
                     )
                     .await?;
-                    self.dataset.v1_reader_cache.insert(path.clone(), new_reader.clone());
+                    self.dataset
+                        .v1_reader_cache
+                        .insert(path.clone(), new_reader.clone());
                     new_reader
                 };
 
