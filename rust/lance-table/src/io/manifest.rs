@@ -26,15 +26,59 @@ use crate::format::{DataStorageFormat, IndexMetadata, MAGIC, Manifest, Transacti
 
 use super::commit::ManifestLocation;
 
+/// Wrapper around `object_store.inner.get_range()` that retries on transient
+/// errors (e.g. mid-stream body download failures from S3). The upstream
+/// `object_store` crate only retries on the initial HTTP request, not on
+/// failures during body streaming. This mirrors the retry logic used by
+/// `CloudObjectReader` in `lance-io`.
+async fn get_range_with_retry(
+    object_store: &ObjectStore,
+    path: &Path,
+    range: Range<u64>,
+    retry_count: usize,
+) -> Result<Bytes> {
+    let mut retries = retry_count;
+    loop {
+        match object_store.inner.get_range(path, range.clone()).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(err) => {
+                if retries == 0 {
+                    log::warn!(
+                        "Failed to read manifest range {:?} from {} after {} attempts. \
+                         Error details: {:?}",
+                        range,
+                        path,
+                        retry_count + 1,
+                        err,
+                    );
+                    return Err(err.into());
+                }
+                log::info!(
+                    "Retrying manifest read range {:?} from {} \
+                     (remaining retries: {}). Error: {:?}",
+                    range,
+                    path,
+                    retries,
+                    err,
+                );
+                retries -= 1;
+            }
+        }
+    }
+}
+
 /// Read Manifest on URI.
 ///
 /// This only reads manifest files. It does not read data files.
+/// Retries transient S3 errors (including mid-stream body failures)
+/// up to `object_store.download_retry_count()` times per range request.
 #[instrument(level = "debug", skip(object_store))]
 pub async fn read_manifest(
     object_store: &ObjectStore,
     path: &Path,
     known_size: Option<u64>,
 ) -> Result<Manifest> {
+    let retry_count = object_store.download_retry_count();
     let file_size = if let Some(known_size) = known_size {
         known_size
     } else {
@@ -46,7 +90,7 @@ pub async fn read_manifest(
         start: initial_start,
         end: file_size,
     };
-    let buf = object_store.inner.get_range(path, range).await?;
+    let buf = get_range_with_retry(object_store, path, range, retry_count).await?;
 
     // In case of corruption, the known_size might be wrong. We can retry without
     // the size to be more robust.
@@ -75,18 +119,15 @@ pub async fn read_manifest(
     } else {
         // The prefetch only captured part of the manifest. We need to make an
         // additional range request to read the remainder.
-        let mut buf2: BytesMut = object_store
-            .inner
-            .get_range(
-                path,
-                Range {
-                    start: manifest_pos as u64,
-                    end: file_size - PREFETCH_SIZE,
-                },
-            )
-            .await?
-            .into_iter()
-            .collect();
+        let remainder_range = Range {
+            start: manifest_pos as u64,
+            end: file_size - PREFETCH_SIZE,
+        };
+        let mut buf2: BytesMut =
+            get_range_with_retry(object_store, path, remainder_range, retry_count)
+                .await?
+                .into_iter()
+                .collect();
         buf2.extend_from_slice(&buf);
         buf2.freeze()
     };

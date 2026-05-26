@@ -556,6 +556,11 @@ impl ObjectStore {
             .unwrap_or(self.io_parallelism)
     }
 
+    /// Number of times to retry a download that fails during body streaming.
+    pub fn download_retry_count(&self) -> usize {
+        self.download_retry_count
+    }
+
     /// Get the IO tracker for this object store
     ///
     /// The IO tracker can be used to get statistics about read/write operations
