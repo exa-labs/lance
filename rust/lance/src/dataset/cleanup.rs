@@ -194,19 +194,116 @@ impl<'a> CleanupTask<'a> {
         Ok(final_stats)
     }
 
+    /// Maximum number of retry rounds for manifests that fail during
+    /// `process_manifests`. Each round re-attempts all manifests that failed
+    /// in the previous round.
+    const MANIFEST_RETRY_ROUNDS: usize = 3;
+
     #[instrument(level = "debug", skip_all)]
     async fn process_manifests(
         &'a self,
         tagged_versions: &HashSet<u64>,
     ) -> Result<CleanupInspection> {
         let inspection = Mutex::new(CleanupInspection::default());
-        self.dataset
+        let io_parallelism = self.dataset.object_store.io_parallelism();
+
+        // Collect all manifest locations first so we can retry failures.
+        let locations: Vec<ManifestLocation> = self
+            .dataset
             .commit_handler
             .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
-            .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
-                self.process_manifest_file(location, &inspection, tagged_versions)
-            })
+            .try_collect()
             .await?;
+
+        let total = locations.len();
+        info!(
+            "Processing {} manifest files (concurrency={})",
+            total, io_parallelism
+        );
+
+        let failed: Mutex<Vec<(ManifestLocation, String)>> = Mutex::new(Vec::new());
+
+        // First pass: process all manifests, collecting failures instead of aborting.
+        stream::iter(locations)
+            .for_each_concurrent(io_parallelism, |location| {
+                let failed_ref = &failed;
+                let inspection_ref = &inspection;
+                async move {
+                    if let Err(err) = self
+                        .process_manifest_file(location.clone(), inspection_ref, tagged_versions)
+                        .await
+                    {
+                        log::warn!("Failed to process manifest {}: {:?}", location.path, err,);
+                        failed_ref
+                            .lock()
+                            .unwrap()
+                            .push((location, format!("{:?}", err)));
+                    }
+                }
+            })
+            .await;
+
+        // Retry rounds for failed manifests.
+        let mut pending_failures = std::mem::take(&mut *failed.lock().unwrap());
+        for round in 1..=Self::MANIFEST_RETRY_ROUNDS {
+            if pending_failures.is_empty() {
+                break;
+            }
+            let retry_count = pending_failures.len();
+            info!(
+                "Retry round {}/{}: re-processing {} failed manifest(s)",
+                round,
+                Self::MANIFEST_RETRY_ROUNDS,
+                retry_count,
+            );
+            let round_failed: Mutex<Vec<(ManifestLocation, String)>> = Mutex::new(Vec::new());
+
+            stream::iter(pending_failures.into_iter().map(|(loc, _)| loc))
+                .for_each_concurrent(io_parallelism, |location| {
+                    let round_failed_ref = &round_failed;
+                    let inspection_ref = &inspection;
+                    async move {
+                        if let Err(err) = self
+                            .process_manifest_file(
+                                location.clone(),
+                                inspection_ref,
+                                tagged_versions,
+                            )
+                            .await
+                        {
+                            log::warn!(
+                                "Retry round {}: failed to process manifest {}: {:?}",
+                                round,
+                                location.path,
+                                err,
+                            );
+                            round_failed_ref
+                                .lock()
+                                .unwrap()
+                                .push((location, format!("{:?}", err)));
+                        }
+                    }
+                })
+                .await;
+
+            pending_failures = std::mem::take(&mut *round_failed.lock().unwrap());
+        }
+
+        if !pending_failures.is_empty() {
+            let failed_paths: Vec<String> = pending_failures
+                .iter()
+                .map(|(loc, err)| format!("{}: {}", loc.path, err))
+                .collect();
+            return Err(Error::io(format!(
+                "Failed to read {} manifest(s) after {} retry rounds: [{}]",
+                pending_failures.len(),
+                Self::MANIFEST_RETRY_ROUNDS,
+                failed_paths.join(", "),
+            )));
+        }
+
+        let succeeded = total;
+        info!("Successfully processed all {} manifests", succeeded);
         Ok(inspection.into_inner().unwrap())
     }
 
