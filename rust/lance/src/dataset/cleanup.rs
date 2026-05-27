@@ -63,7 +63,10 @@ use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
     future,
-    sync::{Mutex, MutexGuard},
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use tokio::time::{MissedTickBehavior, interval};
@@ -184,6 +187,16 @@ impl<'a> CleanupTask<'a> {
                 .await?
         };
 
+        info!(
+            "Inspection summary: {} old manifests, {} referenced data files, \
+             {} referenced deletion files, {} referenced tx files, {} referenced indices",
+            inspection.old_manifests.len(),
+            inspection.referenced_files.data_paths.len(),
+            inspection.referenced_files.delete_paths.len(),
+            inspection.referenced_files.tx_paths.len(),
+            inspection.referenced_files.index_uuids.len(),
+        );
+
         let stats = self.delete_unreferenced_files(inspection).await?;
         final_stats.bytes_removed += stats.bytes_removed;
         final_stats.old_versions += stats.old_versions;
@@ -222,12 +235,16 @@ impl<'a> CleanupTask<'a> {
         );
 
         let failed: Mutex<Vec<(ManifestLocation, String)>> = Mutex::new(Vec::new());
+        let processed_count = AtomicU64::new(0);
+        let log_interval: u64 = std::cmp::max(total as u64 / 20, 100);
 
         // First pass: process all manifests, collecting failures instead of aborting.
         stream::iter(locations)
             .for_each_concurrent(io_parallelism, |location| {
                 let failed_ref = &failed;
                 let inspection_ref = &inspection;
+                let processed_ref = &processed_count;
+                let total_manifests = total;
                 async move {
                     if let Err(err) = self
                         .process_manifest_file(location.clone(), inspection_ref, tagged_versions)
@@ -238,6 +255,15 @@ impl<'a> CleanupTask<'a> {
                             .lock()
                             .unwrap()
                             .push((location, format!("{:?}", err)));
+                    }
+                    let count = processed_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count % log_interval == 0 || count == total_manifests as u64 {
+                        info!(
+                            "Manifest progress: {}/{} ({:.1}%)",
+                            count,
+                            total_manifests,
+                            count as f64 / total_manifests as f64 * 100.0,
+                        );
                     }
                 }
             })
@@ -530,13 +556,28 @@ impl<'a> CleanupTask<'a> {
             all_paths_to_remove.boxed()
         };
 
+        let delete_count = AtomicU64::new(0);
+        let paths_with_progress = paths_to_delete.map_ok(|path| {
+            let count = delete_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if count % 1000 == 0 {
+                info!("Delete progress: {} files submitted", count);
+            }
+            path
+        });
+
         let delete_fut = self
             .dataset
             .object_store
-            .remove_stream(paths_to_delete)
+            .remove_stream(paths_with_progress.boxed())
             .try_for_each(|_| future::ready(Ok(())));
 
         delete_fut.await?;
+
+        let total_deleted = delete_count.load(Ordering::Relaxed);
+        info!(
+            "Delete phase complete: {} files deleted ({} old manifests)",
+            total_deleted, num_old_manifests,
+        );
 
         let mut removal_stats = removal_stats.into_inner().unwrap();
         removal_stats.old_versions = num_old_manifests as u64;
