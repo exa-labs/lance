@@ -3732,9 +3732,18 @@ mod tests {
 
     #[test]
     fn test_delete_batch_size() {
-        assert_eq!(delete_batch_size("s3"), S3_DELETE_STREAM_BATCH_SIZE as usize);
-        assert_eq!(delete_batch_size("s3+ddb"), S3_DELETE_STREAM_BATCH_SIZE as usize);
-        assert_eq!(delete_batch_size("az"), AZURE_DELETE_STREAM_BATCH_SIZE as usize);
+        assert_eq!(
+            delete_batch_size("s3"),
+            S3_DELETE_STREAM_BATCH_SIZE as usize
+        );
+        assert_eq!(
+            delete_batch_size("s3+ddb"),
+            S3_DELETE_STREAM_BATCH_SIZE as usize
+        );
+        assert_eq!(
+            delete_batch_size("az"),
+            AZURE_DELETE_STREAM_BATCH_SIZE as usize
+        );
         assert_eq!(delete_batch_size("file"), 1);
         assert_eq!(delete_batch_size("memory"), 1);
     }
