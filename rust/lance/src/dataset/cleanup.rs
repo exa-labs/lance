@@ -541,15 +541,16 @@ impl<'a> CleanupTask<'a> {
             stream::iter(vec![unreferenced_paths, old_manifests_stream]).flatten();
 
         let total_deleted = if let Some(rate) = self.policy.delete_rate_limit {
-            // Manual batch-level rate limiting: collect paths into batches of
-            // up to 1000 and feed each batch to remove_stream individually,
-            // sleeping between batches. This is necessary because the S3
+            // Manual batch-level rate limiting: collect paths into batches
+            // and feed each batch to remove_stream individually, sleeping
+            // between batches. For S3 this is necessary because the
             // delete_stream implementation uses .buffered(20) internally,
-            // which would defeat any per-path rate limiting on the input stream.
-            let batch_interval =
-                calculate_batch_interval(self.dataset.object_store.scheme().to_string(), rate);
+            // which defeats any per-path rate limiting on the input stream.
+            let scheme = self.dataset.object_store.scheme().to_string();
+            let max_batch = delete_batch_size(&scheme);
+            let batch_interval = calculate_batch_interval(&scheme, rate);
             let mut all_paths = all_paths_to_remove.boxed();
-            let mut batch: Vec<Result<Path>> = Vec::with_capacity(1000);
+            let mut batch: Vec<Result<Path>> = Vec::with_capacity(max_batch);
             let mut total: u64 = 0;
 
             loop {
@@ -557,7 +558,7 @@ impl<'a> CleanupTask<'a> {
                     Some(path) => {
                         total += 1;
                         batch.push(Ok(path));
-                        if batch.len() >= 1000 {
+                        if batch.len() >= max_batch {
                             info!("Delete progress: {} files submitted", total);
                             let batch_stream = stream::iter(batch.drain(..).collect::<Vec<_>>());
                             self.dataset
@@ -1030,20 +1031,29 @@ impl<'a> CleanupTask<'a> {
     }
 }
 
+/// Return the scheme-dependent batch size for delete operations.
+///
+/// S3 DeleteObjects handles up to 1000 keys per call; Azure up to 256.
+/// Other backends (local, GCS) are treated as single-file deletes.
+fn delete_batch_size(scheme: &str) -> usize {
+    let lower = scheme.to_lowercase();
+    if lower.contains("s3") {
+        S3_DELETE_STREAM_BATCH_SIZE as usize
+    } else if lower.contains("az") {
+        AZURE_DELETE_STREAM_BATCH_SIZE as usize
+    } else {
+        1
+    }
+}
+
 /// Compute the sleep duration between batch delete API calls.
 ///
 /// `rate` is the number of batch API requests per second (e.g., S3
 /// DeleteObjects calls). Each call deletes up to 1000 keys for S3, 256
 /// for Azure.
-fn calculate_batch_interval(scheme: String, rate: u64) -> Duration {
+fn calculate_batch_interval(scheme: &str, rate: u64) -> Duration {
     let effective_rate = rate.max(1);
-    let batch_size = if scheme.to_lowercase().contains("s3") {
-        S3_DELETE_STREAM_BATCH_SIZE
-    } else if scheme.to_lowercase().contains("az") {
-        AZURE_DELETE_STREAM_BATCH_SIZE
-    } else {
-        1
-    };
+    let batch_size = delete_batch_size(scheme);
     let interval_ms = 1_000u64.div_ceil(effective_rate);
     info!(
         "delete_rate_limit enabled: {} API requests/sec, batch_size={}, \
@@ -3721,28 +3731,37 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_batch_size() {
+        assert_eq!(delete_batch_size("s3"), S3_DELETE_STREAM_BATCH_SIZE as usize);
+        assert_eq!(delete_batch_size("s3+ddb"), S3_DELETE_STREAM_BATCH_SIZE as usize);
+        assert_eq!(delete_batch_size("az"), AZURE_DELETE_STREAM_BATCH_SIZE as usize);
+        assert_eq!(delete_batch_size("file"), 1);
+        assert_eq!(delete_batch_size("memory"), 1);
+    }
+
+    #[test]
     fn test_calculate_batch_interval_s3() {
         // rate=3 → one batch every 334ms (ceil(1000/3))
         assert_eq!(
-            calculate_batch_interval("s3".to_string(), 3),
+            calculate_batch_interval("s3", 3),
             Duration::from_millis(334),
         );
 
         // rate=1 → one batch per second
         assert_eq!(
-            calculate_batch_interval("s3".to_string(), 1),
+            calculate_batch_interval("s3", 1),
             Duration::from_millis(1000),
         );
 
         // rate=0 clamped to 1 → same as rate=1
         assert_eq!(
-            calculate_batch_interval("s3".to_string(), 0),
+            calculate_batch_interval("s3", 0),
             Duration::from_millis(1000),
         );
 
         // Large rate → 1ms floor
         assert_eq!(
-            calculate_batch_interval("s3".to_string(), 2_000_000),
+            calculate_batch_interval("s3", 2_000_000),
             Duration::from_millis(1),
         );
     }
