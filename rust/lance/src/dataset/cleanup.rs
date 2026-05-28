@@ -69,7 +69,7 @@ use std::{
     time::Duration,
 };
 use tokio::time;
-use tracing::{Span, debug, info, instrument};
+use tracing::{Span, debug, info, instrument, warn};
 
 #[derive(Clone, Debug, Default)]
 struct ReferencedFiles {
@@ -560,13 +560,11 @@ impl<'a> CleanupTask<'a> {
                         batch.push(Ok(path));
                         if batch.len() >= max_batch {
                             info!("Delete progress: {} files submitted", total);
-                            let batch_stream = stream::iter(batch.drain(..).collect::<Vec<_>>());
-                            self.dataset
-                                .object_store
-                                .remove_stream(batch_stream.boxed())
-                                .try_for_each(|_| future::ready(Ok(())))
-                                .await?;
-                            time::sleep(batch_interval).await;
+                            self.delete_batch_with_retry(
+                                batch.drain(..).collect(),
+                                &batch_interval,
+                            )
+                            .await?;
                         }
                     }
                     None => break,
@@ -574,12 +572,7 @@ impl<'a> CleanupTask<'a> {
             }
             if !batch.is_empty() {
                 info!("Delete progress: {} files submitted (final batch)", total);
-                let batch_stream = stream::iter(batch);
-                self.dataset
-                    .object_store
-                    .remove_stream(batch_stream.boxed())
-                    .try_for_each(|_| future::ready(Ok(())))
-                    .await?;
+                self.delete_batch_with_retry(batch, &batch_interval).await?;
             }
             total
         } else {
@@ -623,6 +616,67 @@ impl<'a> CleanupTask<'a> {
         );
 
         Ok(removal_stats)
+    }
+
+    /// Delete a batch of paths via `remove_stream`, retrying on transient errors
+    /// (e.g. S3 InternalError) with exponential backoff before propagating failure.
+    async fn delete_batch_with_retry(
+        &self,
+        paths: Vec<Result<Path>>,
+        rate_limit_interval: &Duration,
+    ) -> Result<()> {
+        const MAX_RETRIES: u32 = 3;
+        const INITIAL_BACKOFF: Duration = Duration::from_secs(5);
+
+        let mut last_err = None;
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let backoff = INITIAL_BACKOFF * 2u32.pow(attempt - 1);
+                warn!(
+                    "Retrying delete batch (attempt {}/{}) after {:.1}s backoff",
+                    attempt,
+                    MAX_RETRIES,
+                    backoff.as_secs_f64(),
+                );
+                time::sleep(backoff).await;
+            }
+
+            let batch_stream = stream::iter(paths.iter().map(|r| {
+                r.as_ref()
+                    .map(|p| p.clone())
+                    .map_err(|e| Error::io(format!("path error during delete retry: {e}")))
+            }));
+            let result = self
+                .dataset
+                .object_store
+                .remove_stream(batch_stream.boxed())
+                .try_for_each(|_| future::ready(Ok(())))
+                .await;
+
+            match result {
+                Ok(()) => {
+                    time::sleep(*rate_limit_interval).await;
+                    return Ok(());
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let is_transient = msg.contains("InternalError")
+                        || msg.contains("503")
+                        || msg.contains("SlowDown")
+                        || msg.contains("ServiceUnavailable")
+                        || msg.contains("RequestTimeout");
+                    if !is_transient || attempt == MAX_RETRIES {
+                        return Err(e);
+                    }
+                    warn!(
+                        "Transient error during delete batch: {}",
+                        msg.chars().take(200).collect::<String>(),
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Error::io("delete batch retry exhausted without error")))
     }
 
     fn path_if_not_referenced(
@@ -3800,5 +3854,38 @@ mod tests {
             stats.old_versions > 0,
             "expected some old versions to be removed"
         );
+    }
+
+    #[test]
+    fn test_transient_error_detection() {
+        let transient_messages = [
+            "DeleteObjects request failed: We encountered an internal error. Please try again. (code: InternalError)",
+            "Service returned 503 SlowDown",
+            "SlowDown: Please reduce your request rate",
+            "ServiceUnavailable: Service is temporarily unavailable",
+            "RequestTimeout: Your socket connection was not read from",
+        ];
+        for msg in &transient_messages {
+            let is_transient = msg.contains("InternalError")
+                || msg.contains("503")
+                || msg.contains("SlowDown")
+                || msg.contains("ServiceUnavailable")
+                || msg.contains("RequestTimeout");
+            assert!(is_transient, "expected transient: {msg}");
+        }
+
+        let non_transient_messages = [
+            "AccessDenied: Access Denied",
+            "NoSuchBucket: The specified bucket does not exist",
+            "InvalidRequest: Invalid request",
+        ];
+        for msg in &non_transient_messages {
+            let is_transient = msg.contains("InternalError")
+                || msg.contains("503")
+                || msg.contains("SlowDown")
+                || msg.contains("ServiceUnavailable")
+                || msg.contains("RequestTimeout");
+            assert!(!is_transient, "expected non-transient: {msg}");
+        }
     }
 }
