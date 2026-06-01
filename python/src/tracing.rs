@@ -248,7 +248,13 @@ impl tracing_subscriber::Layer<Registry> for LoggingPassthroughRef {
 
         let mut fields = EventToStr::default();
         event.record(&mut fields);
-        log::log!(target: "lance::events", state.level, "target=\"{}\" {}", event.metadata().target(), fields.str);
+        // Forward the event under its real tracing target (e.g. `lance::file_audit`,
+        // `lance::dataset::cleanup`) rather than a single fixed `lance::events` target.
+        // env_logger only filters by the log record's target, so preserving it lets
+        // `LANCE_LOG` directives target specific event families (e.g. silencing the
+        // high-volume per-file `lance::file_audit` events while keeping other INFO logs).
+        let event_target = event.metadata().target();
+        log::log!(target: event_target, state.level, "target=\"{}\" {}", event_target, fields.str);
 
         if let Some(callback_sender) = state.callback_sender.as_ref() {
             let mut args = EventToMap::default();
