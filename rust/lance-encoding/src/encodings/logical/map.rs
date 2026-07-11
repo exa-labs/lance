@@ -114,8 +114,9 @@ impl StructuralFieldScheduler for StructuralMapScheduler {
         &'a mut self,
         filter: &'a FilterExpression,
         context: &'a SchedulerContext,
+        init_ranges: Option<&'a [Range<u64>]>,
     ) -> BoxFuture<'a, Result<()>> {
-        self.child.initialize(filter, context)
+        self.child.initialize(filter, context, init_ranges)
     }
 }
 

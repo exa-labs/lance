@@ -521,6 +521,7 @@ fn bench_decode_compressed_parallel(c: &mut Criterion) {
                                 cache,
                                 &filter,
                                 &DecoderConfig::default(),
+                                None,
                             )
                             .await
                             .unwrap();

@@ -2052,6 +2052,109 @@ pub mod tests {
         assert_eq!(batches[0].num_columns(), 1);
     }
 
+    #[rstest]
+    #[tokio::test]
+    async fn test_lazy_page_metadata_init(
+        #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
+    ) {
+        let fs = FsFixture::default();
+        let WrittenFile { data, .. } = create_some_file(&fs, version).await;
+        let total_rows = data.iter().map(|batch| batch.num_rows()).sum::<usize>() as u32;
+
+        let lazy_options = FileReaderOptions {
+            decoder_config: DecoderConfig {
+                lazy_page_metadata_init: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let read = |options: FileReaderOptions, params: lance_io::ReadBatchParams| {
+            let fs = &fs;
+            async move {
+                let file_scheduler = fs
+                    .scheduler
+                    .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+                    .await
+                    .unwrap();
+                // A fresh cache each time so nothing is initialized from a previous read
+                let file_reader = FileReader::try_open(
+                    file_scheduler,
+                    None,
+                    Arc::<DecoderPlugins>::default(),
+                    &test_cache(),
+                    options,
+                )
+                .await
+                .unwrap();
+                file_reader
+                    .read_stream(params, total_rows, 16, FilterExpression::no_filter())
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let params: Vec<lance_io::ReadBatchParams> = vec![
+            // Point read within a single page
+            lance_io::ReadBatchParams::Indices(UInt32Array::from(vec![50_017])),
+            // Indices spread across multiple pages
+            lance_io::ReadBatchParams::Indices(UInt32Array::from(vec![
+                0,
+                33_333,
+                66_666,
+                total_rows - 1,
+            ])),
+            // A small range and a multi-page range
+            lance_io::ReadBatchParams::Ranges(Arc::from(vec![100_u64..200_u64])),
+            lance_io::ReadBatchParams::Ranges(Arc::from(vec![
+                1_000_u64..2_000_u64,
+                80_000_u64..90_000_u64,
+            ])),
+            // Full scan
+            lance_io::ReadBatchParams::RangeFull,
+        ];
+
+        for param in params {
+            let eager = read(FileReaderOptions::default(), param.clone()).await;
+            let lazy = read(lazy_options.clone(), param.clone()).await;
+            assert_eq!(eager, lazy, "mismatch for params {:?}", param);
+        }
+
+        // Reads sharing a cache should be able to reuse per-page metadata across requests
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let cache = test_cache();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &cache,
+            lazy_options,
+        )
+        .await
+        .unwrap();
+        for indices in [vec![50_017_u32], vec![50_017], vec![10, 99_000]] {
+            let batches = file_reader
+                .read_stream(
+                    lance_io::ReadBatchParams::Indices(UInt32Array::from(indices.clone())),
+                    total_rows,
+                    16,
+                    FilterExpression::no_filter(),
+                )
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let num_rows = batches.iter().map(|b| b.num_rows()).sum::<usize>();
+            assert_eq!(num_rows, indices.len());
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_drop_in_progress() {
         let fs = FsFixture::default();
@@ -2141,6 +2244,7 @@ pub mod tests {
             test_cache(),
             &FilterExpression::no_filter(),
             &DecoderConfig::default(),
+            None,
         )
         .await
         .unwrap();

@@ -1013,6 +1013,7 @@ impl DecodeBatchScheduler {
         cache: Arc<LanceCache>,
         filter: &FilterExpression,
         decoder_config: &DecoderConfig,
+        init_ranges: Option<&[Range<u64>]>,
     ) -> Result<Self> {
         assert!(num_rows > 0);
         let buffers = FileBuffers {
@@ -1038,7 +1039,9 @@ impl DecodeBatchScheduler {
                 strategy.create_structural_field_scheduler(&root_field, &mut column_iter)?;
 
             let context = SchedulerContext::new(io, cache.clone());
-            root_scheduler.initialize(filter, &context).await?;
+            root_scheduler
+                .initialize(filter, &context, init_ranges)
+                .await?;
 
             Ok(Self {
                 root_scheduler: RootScheduler::Structural(root_scheduler),
@@ -1858,6 +1861,22 @@ impl RequestedRows {
         }
         self
     }
+
+    /// Converts the requested rows into row ranges (sorting and coalescing indices)
+    pub fn to_ranges(&self) -> Vec<Range<u64>> {
+        match self {
+            Self::Ranges(ranges) => ranges.clone(),
+            Self::Indices(indices) => {
+                if indices.is_empty() {
+                    return Vec::new();
+                }
+                let mut indices = indices.clone();
+                indices.sort_unstable();
+                indices.dedup();
+                DecodeBatchScheduler::indices_to_ranges(&indices)
+            }
+        }
+    }
 }
 
 /// Configuration for decoder behavior
@@ -1872,6 +1891,17 @@ pub struct DecoderConfig {
     pub cache_repetition_index: bool,
     /// Whether to validate decoded data
     pub validate_on_decode: bool,
+    /// Whether to initialize page metadata lazily, fetching it only for the pages that
+    /// overlap the requested row ranges.
+    ///
+    /// By default page metadata (e.g. mini-block chunk metadata, dictionaries, repetition
+    /// indices) is fetched for every page of every projected column when the scheduler is
+    /// created.  That is the right behavior for scans, which touch every page anyway, but
+    /// for cold random point reads it can amplify a single-row read into one small read
+    /// per page.  Enabling this option restricts the metadata fetches to the pages that
+    /// overlap the requested rows.  Partially initialized columns are cached per-page
+    /// rather than as a whole-column entry.
+    pub lazy_page_metadata_init: bool,
 }
 
 impl Default for DecoderConfig {
@@ -1879,6 +1909,7 @@ impl Default for DecoderConfig {
         Self {
             cache_repetition_index: default_cache_repetition_index(),
             validate_on_decode: false,
+            lazy_page_metadata_init: false,
         }
     }
 }
@@ -2011,6 +2042,11 @@ fn create_scheduler_decoder(
         rx,
     )?;
 
+    let init_ranges = config
+        .decoder_config
+        .lazy_page_metadata_init
+        .then(|| requested_rows.to_ranges());
+
     let scheduler_handle = tokio::task::spawn(async move {
         let mut decode_scheduler = match DecodeBatchScheduler::try_new(
             target_schema.as_ref(),
@@ -2023,6 +2059,7 @@ fn create_scheduler_decoder(
             config.cache,
             &filter,
             &config.decoder_config,
+            init_ranges.as_deref(),
         )
         .await
         {
@@ -2130,6 +2167,11 @@ pub fn schedule_and_decode_blocking(
 
     let (tx, mut rx) = mpsc::unbounded_channel();
 
+    let init_ranges = config
+        .decoder_config
+        .lazy_page_metadata_init
+        .then(|| requested_rows.to_ranges());
+
     // Initialize the scheduler.  This is still "asynchronous" but we run it with a current-thread
     // runtime.
     let mut decode_scheduler = WAITER_RT.block_on(DecodeBatchScheduler::try_new(
@@ -2143,6 +2185,7 @@ pub fn schedule_and_decode_blocking(
         config.cache,
         &filter,
         &config.decoder_config,
+        init_ranges.as_deref(),
     ))?;
 
     // Schedule the requested rows
@@ -2489,10 +2532,16 @@ impl FilterExpression {
 }
 
 pub trait StructuralFieldScheduler: Send + std::fmt::Debug {
+    /// Fetches any metadata required before scheduling
+    ///
+    /// If `init_ranges` is provided then only the metadata needed to schedule those row
+    /// ranges must be fetched.  Scheduling ranges that were not covered at initialization
+    /// is an error.  If `init_ranges` is `None` then metadata is fetched for all rows.
     fn initialize<'a>(
         &'a mut self,
         filter: &'a FilterExpression,
         context: &'a SchedulerContext,
+        init_ranges: Option<&'a [Range<u64>]>,
     ) -> BoxFuture<'a, Result<()>>;
     fn schedule_ranges<'a>(
         &'a self,
@@ -2699,6 +2748,7 @@ pub async fn decode_batch(
         cache,
         filter,
         &DecoderConfig::default(),
+        None,
     )
     .await?;
     let (tx, rx) = unbounded_channel();

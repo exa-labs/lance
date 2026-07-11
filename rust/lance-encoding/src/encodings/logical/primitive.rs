@@ -32,7 +32,7 @@ use itertools::Itertools;
 use lance_arrow::DataTypeExt;
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{
-    cache::{CacheKey, Context, DeepSizeOf},
+    cache::{CacheKey, Context, DeepSizeOf, LanceCache},
     error::{Error, LanceOptionExt},
     utils::bit::pad_bytes,
 };
@@ -3143,6 +3143,13 @@ impl StructuralSchedulingJob for StructuralPrimitiveFieldSchedulingJob<'_> {
             cur_page = &self.scheduler.page_schedulers[self.page_idx];
         }
 
+        if !cur_page.initialized {
+            return Err(Error::internal(format!(
+                "page {} of column {} was scheduled but never initialized (the ranges provided at initialization did not cover it)",
+                cur_page.page_index, self.scheduler.column_index
+            )));
+        }
+
         // Now the cur_page has overlap with range.  Continue looping through ranges
         // until we find a range that exceeds the current page
 
@@ -3211,6 +3218,7 @@ struct PageInfoAndScheduler {
     page_index: usize,
     num_rows: u64,
     scheduler: Box<dyn StructuralPageScheduler>,
+    initialized: bool,
 }
 
 /// A scheduler for a leaf node
@@ -3373,7 +3381,77 @@ impl StructuralPrimitiveFieldScheduler {
             page_index,
             num_rows: page_info.num_rows,
             scheduler,
+            initialized: false,
         })
+    }
+
+    /// Returns, for each page, whether the page overlaps any of the given row ranges
+    fn pages_overlapping_ranges(&self, ranges: &[Range<u64>]) -> Vec<bool> {
+        let mut overlaps = vec![false; self.page_schedulers.len()];
+        let mut row_offset = 0;
+        for (page_idx, page) in self.page_schedulers.iter().enumerate() {
+            let page_range = row_offset..row_offset + page.num_rows;
+            overlaps[page_idx] = ranges
+                .iter()
+                .any(|r| r.start < page_range.end && r.end > page_range.start);
+            row_offset += page.num_rows;
+        }
+        overlaps
+    }
+
+    /// Initializes only the pages marked in `pages_needed`, consulting and populating a
+    /// per-page cache entry for each.  The whole-column [`CachedFieldData`] entry is not
+    /// written because the column is only partially initialized.
+    async fn initialize_pages_lazily(
+        &mut self,
+        cache: &Arc<LanceCache>,
+        pages_needed: &[bool],
+        context: &SchedulerContext,
+    ) -> Result<()> {
+        let column_index = self.column_index;
+        let mut cached_pages = HashMap::new();
+        for (page_index, needed) in pages_needed.iter().enumerate() {
+            if !needed {
+                continue;
+            }
+            let page_key = PageDataCacheKey {
+                column_index,
+                page_index,
+            };
+            if let Some(entry) = cache.get_with_key(&page_key).await {
+                cached_pages.insert(page_index, entry);
+            }
+        }
+        let mut init_futures = self
+            .page_schedulers
+            .iter_mut()
+            .enumerate()
+            .filter(|(page_index, _)| pages_needed[*page_index])
+            .filter_map(|(page_index, page_scheduler)| {
+                if let Some(entry) = cached_pages.remove(&page_index) {
+                    page_scheduler.scheduler.load(&entry.page);
+                    page_scheduler.initialized = true;
+                    None
+                } else {
+                    let io = context.io().clone();
+                    Some(async move {
+                        let page_data = page_scheduler.scheduler.initialize(&io).await?;
+                        page_scheduler.initialized = true;
+                        Result::Ok((page_index, page_data))
+                    })
+                }
+            })
+            .collect::<FuturesOrdered<_>>();
+        while let Some((page_index, page_data)) = init_futures.try_next().await? {
+            let page_key = PageDataCacheKey {
+                column_index,
+                page_index,
+            };
+            cache
+                .insert_with_key(&page_key, Arc::new(CachedPageDataEntry { page: page_data }))
+                .await;
+        }
+        Ok(())
     }
 }
 
@@ -3418,11 +3496,40 @@ impl CacheKey for FieldDataCacheKey {
     }
 }
 
+/// Cached metadata for a single page, used when pages are initialized lazily
+/// (only the pages overlapping the requested row ranges) and so a complete
+/// [`CachedFieldData`] entry cannot be built.
+pub struct CachedPageDataEntry {
+    page: Arc<dyn CachedPageData>,
+}
+
+impl DeepSizeOf for CachedPageDataEntry {
+    fn deep_size_of_children(&self, ctx: &mut Context) -> usize {
+        self.page.deep_size_of_children(ctx)
+    }
+}
+
+// Cache key for a single page's metadata
+#[derive(Debug, Clone)]
+pub struct PageDataCacheKey {
+    pub column_index: u32,
+    pub page_index: usize,
+}
+
+impl CacheKey for PageDataCacheKey {
+    type ValueType = CachedPageDataEntry;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("{}/page/{}", self.column_index, self.page_index).into()
+    }
+}
+
 impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
     fn initialize<'a>(
         &'a mut self,
         _filter: &'a FilterExpression,
         context: &'a SchedulerContext,
+        init_ranges: Option<&'a [Range<u64>]>,
     ) -> BoxFuture<'a, Result<()>> {
         let cache_key = FieldDataCacheKey {
             column_index: self.column_index,
@@ -3436,8 +3543,18 @@ impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
                     .zip(cached_data.pages.iter())
                     .for_each(|(page_scheduler, cached_data)| {
                         page_scheduler.scheduler.load(cached_data);
+                        page_scheduler.initialized = true;
                     });
                 return Ok(());
+            }
+
+            let pages_needed = init_ranges.map(|ranges| self.pages_overlapping_ranges(ranges));
+            if let Some(pages_needed) =
+                pages_needed.filter(|pages_needed| pages_needed.iter().any(|needed| !needed))
+            {
+                return self
+                    .initialize_pages_lazily(&cache, &pages_needed, context)
+                    .await;
             }
 
             let page_data = self
@@ -3447,6 +3564,9 @@ impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
                 .collect::<FuturesOrdered<_>>();
 
             let page_data = page_data.try_collect::<Vec<_>>().await?;
+            self.page_schedulers
+                .iter_mut()
+                .for_each(|page_scheduler| page_scheduler.initialized = true);
             let cached_data = Arc::new(CachedFieldData { pages: page_data });
             cache.insert_with_key(&cache_key, cached_data).await;
             Ok(())
