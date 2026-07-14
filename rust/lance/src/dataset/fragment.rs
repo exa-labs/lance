@@ -934,6 +934,14 @@ impl FileFragment {
         let schema_per_file = Arc::new(projection.intersection_ignore_types(&data_file_schema)?);
 
         if data_file.is_legacy_file() {
+            use std::sync::atomic::{AtomicBool, Ordering as AtomOrd};
+            static LOGGED_V1: AtomicBool = AtomicBool::new(false);
+            if !LOGGED_V1.swap(true, AtomOrd::Relaxed) {
+                eprintln!(
+                    "[lance-format] data_file uses V1 (legacy) format: version={}.{} path={}",
+                    data_file.file_major_version, data_file.file_minor_version, data_file.path
+                );
+            }
             let max_field_id = data_file.fields.iter().max().unwrap();
             if !schema_per_file.fields.is_empty() {
                 let path = self
@@ -941,16 +949,28 @@ impl FileFragment {
                     .data_file_dir(data_file)?
                     .child(data_file.path.as_str());
                 let field_id_offset = Self::get_field_id_offset(data_file);
-                let reader = PreviousFileReader::try_new_with_fragment_id(
-                    &self.dataset.object_store,
-                    &path,
-                    self.schema().clone(),
-                    self.id() as u32,
-                    field_id_offset as i32,
-                    *max_field_id,
-                    Some(&self.dataset.metadata_cache.file_metadata_cache(&path)),
-                )
-                .await?;
+
+                // Try to get a cached V1 reader first (avoids re-opening S3 file
+                // handles and re-reading metadata/page tables on every request)
+                let reader = if let Some(cached) = self.dataset.v1_reader_cache.get(&path) {
+                    cached.clone()
+                } else {
+                    let new_reader = PreviousFileReader::try_new_with_fragment_id(
+                        &self.dataset.object_store,
+                        &path,
+                        self.schema().clone(),
+                        self.id() as u32,
+                        field_id_offset as i32,
+                        *max_field_id,
+                        Some(&self.dataset.metadata_cache.file_metadata_cache(&path)),
+                    )
+                    .await?;
+                    self.dataset
+                        .v1_reader_cache
+                        .insert(path.clone(), new_reader.clone());
+                    new_reader
+                };
+
                 let initialized_schema = reader.schema().project_by_schema(
                     schema_per_file.as_ref(),
                     OnMissing::Error,
@@ -964,6 +984,16 @@ impl FileFragment {
         } else if schema_per_file.fields.is_empty() {
             Ok(None)
         } else {
+            {
+                use std::sync::atomic::{AtomicBool, Ordering as AtomOrd};
+                static LOGGED_V2: AtomicBool = AtomicBool::new(false);
+                if !LOGGED_V2.swap(true, AtomOrd::Relaxed) {
+                    eprintln!(
+                        "[lance-format] data_file uses V2 format: version={}.{} path={}",
+                        data_file.file_major_version, data_file.file_minor_version, data_file.path
+                    );
+                }
+            }
             let path = self
                 .dataset
                 .data_file_dir(data_file)?
@@ -983,17 +1013,38 @@ impl FileFragment {
                     read_config.reader_priority.unwrap_or(0),
                 )
             } else {
-                (
-                    ScanScheduler::new(
-                        self.dataset.object_store.clone(),
-                        SchedulerConfig::max_bandwidth(&self.dataset.object_store),
-                    ),
-                    0,
-                )
+                // Reuse the dataset's shared scan scheduler to avoid creating
+                // new HTTP connection pools per fragment read.
+                (self.dataset.scan_scheduler.clone(), 0)
             };
-            let file_scheduler = store_scheduler
-                .open_file_with_priority(&path, reader_priority as u64, &data_file.file_size_bytes)
-                .await?;
+            // Check the dataset's file scheduler cache first to avoid
+            // re-opening S3 file handles for the same data file across requests.
+            let file_scheduler =
+                if data_file.base_id.is_none() && read_config.scan_scheduler.is_none() {
+                    if let Some(cached) = self.dataset.file_scheduler_cache.get(&path) {
+                        cached.value().clone()
+                    } else {
+                        let scheduler = store_scheduler
+                            .open_file_with_priority(
+                                &path,
+                                reader_priority as u64,
+                                &data_file.file_size_bytes,
+                            )
+                            .await?;
+                        self.dataset
+                            .file_scheduler_cache
+                            .insert(path.clone(), scheduler.clone());
+                        scheduler
+                    }
+                } else {
+                    store_scheduler
+                        .open_file_with_priority(
+                            &path,
+                            reader_priority as u64,
+                            &data_file.file_size_bytes,
+                        )
+                        .await?
+                };
             let file_metadata = self.get_file_metadata(&file_scheduler).await?;
             let path = file_scheduler.reader().path().clone();
             let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);

@@ -17,6 +17,7 @@ use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
+use dashmap::DashMap;
 use itertools::Itertools;
 use lance_core::ROW_ADDR;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
@@ -28,6 +29,7 @@ use lance_core::utils::tracing::{
 };
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
+use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
 use lance_index::{DatasetIndexExt, IndexType};
@@ -35,6 +37,7 @@ use lance_io::object_store::{
     LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
     StorageOptionsAccessor, StorageOptionsProvider,
 };
+use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::{read_last_block, read_message, read_metadata_offset, read_struct};
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
@@ -175,6 +178,20 @@ pub struct Dataset {
     /// Object store parameters used when opening this dataset.
     /// These are used when creating object stores for additional base paths.
     pub(crate) store_params: Option<Box<ObjectStoreParams>>,
+
+    /// Shared scan scheduler for reading data files.
+    /// Created once per dataset and reused across all fragment reads to avoid
+    /// creating new HTTP connection pools per read.
+    pub scan_scheduler: Arc<ScanScheduler>,
+
+    /// Cache of opened FileScheduler instances, keyed by file path.
+    /// Avoids re-opening S3 file handles for the same data file across requests.
+    pub file_scheduler_cache: Arc<DashMap<Path, FileScheduler>>,
+
+    /// Cache of opened V1 (legacy) FileReader instances, keyed by file path.
+    /// Avoids re-creating PreviousFileReader objects (and their S3 metadata reads)
+    /// for the same data file across requests.
+    pub v1_reader_cache: Arc<DashMap<Path, PreviousFileReader>>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -706,6 +723,11 @@ impl Dataset {
         let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
         let index_cache = Arc::new(session.index_cache.for_dataset(&uri));
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
+        let scan_scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+        let file_scheduler_cache = Arc::new(DashMap::new());
         Ok(Self {
             object_store,
             base: base_path,
@@ -720,6 +742,9 @@ impl Dataset {
             index_cache,
             file_reader_options,
             store_params: store_params.map(Box::new),
+            scan_scheduler,
+            file_scheduler_cache,
+            v1_reader_cache: Arc::new(DashMap::new()),
         })
     }
 
@@ -1561,6 +1586,13 @@ impl Dataset {
         store_params: Option<ObjectStoreParams>,
     ) -> Self {
         let mut cloned = self.clone();
+        // Create a new scan scheduler for the new object store
+        cloned.scan_scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+        // Clear the file scheduler cache since it's tied to the old object store
+        cloned.file_scheduler_cache = Arc::new(DashMap::new());
         cloned.object_store = object_store;
         if let Some(store_params) = store_params {
             cloned.store_params = Some(Box::new(store_params));

@@ -89,6 +89,14 @@ pub use blob::{BlobArrayBuilder, blob_field};
 pub use dataset::Dataset;
 use lance_index::vector::DIST_COL;
 
+/// Re-export S3 profiling counters from lance-io for external instrumentation
+pub mod profiling {
+    pub use lance_io::scheduler::{
+        reset_s3_counters, s3_bytes_requested, s3_iops_counter, s3_requests_counter,
+    };
+    pub use lance_io::{reset_v1_s3_counters, v1_s3_bytes, v1_s3_calls};
+}
+
 /// Creates and loads a [`Dataset`] from the given path.
 /// Infers the storage backend to use from the scheme in the given table path.
 ///
