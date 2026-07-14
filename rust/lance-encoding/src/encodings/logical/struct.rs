@@ -211,11 +211,12 @@ impl StructuralFieldScheduler for StructuralStructScheduler {
         &'a mut self,
         filter: &'a FilterExpression,
         context: &'a SchedulerContext,
+        init_ranges: Option<&'a [Range<u64>]>,
     ) -> BoxFuture<'a, Result<()>> {
         let children_initialization = self
             .children
             .iter_mut()
-            .map(|child| child.initialize(filter, context))
+            .map(|child| child.initialize(filter, context, init_ranges))
             .collect::<FuturesUnordered<_>>();
         async move {
             children_initialization

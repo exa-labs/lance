@@ -200,6 +200,7 @@ async fn test_decode(
         cache,
         &FilterExpression::no_filter(),
         &DecoderConfig::default(),
+        None,
     )
     .await
     .unwrap();

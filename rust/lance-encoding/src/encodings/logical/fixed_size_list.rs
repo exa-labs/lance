@@ -12,7 +12,7 @@ use std::{ops::Range, sync::Arc};
 use arrow_array::{Array, ArrayRef, GenericListArray, OffsetSizeTrait, StructArray, cast::AsArray};
 use arrow_buffer::{BooleanBufferBuilder, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::DataType;
-use futures::future::BoxFuture;
+use futures::{FutureExt, future::BoxFuture};
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{Error, Result};
 
@@ -147,8 +147,21 @@ impl StructuralFieldScheduler for StructuralFixedSizeListScheduler {
         &'a mut self,
         filter: &'a FilterExpression,
         context: &'a SchedulerContext,
+        init_ranges: Option<&'a [Range<u64>]>,
     ) -> BoxFuture<'a, Result<()>> {
-        self.child.initialize(filter, context)
+        // Scale ranges by dimension to match the child rows, mirroring schedule_ranges
+        let child_ranges = init_ranges.map(|ranges| {
+            ranges
+                .iter()
+                .map(|r| (r.start * self.dimension)..(r.end * self.dimension))
+                .collect::<Vec<_>>()
+        });
+        async move {
+            self.child
+                .initialize(filter, context, child_ranges.as_deref())
+                .await
+        }
+        .boxed()
     }
 }
 
