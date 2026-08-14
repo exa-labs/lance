@@ -5882,7 +5882,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "7.0.0"
+version = "7.0.0+exa.1"
 dependencies = [
  "arrow",
  "arrow-array",
