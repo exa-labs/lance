@@ -353,35 +353,35 @@ impl AsyncWrite for ObjectWriter {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::result::Result<usize, std::io::Error>> {
-        self.as_mut().poll_tasks(cx)?;
+        loop {
+            self.as_mut().poll_tasks(cx)?;
 
-        // Fill buffer up to remaining capacity.
-        let remaining_capacity = self.buffer.capacity() - self.buffer.len();
-        let bytes_to_write = std::cmp::min(remaining_capacity, buf.len());
-        self.buffer.extend_from_slice(&buf[..bytes_to_write]);
-        self.cursor += bytes_to_write;
+            // Fill buffer up to remaining capacity.
+            let remaining_capacity = self.buffer.capacity() - self.buffer.len();
+            let bytes_to_write = std::cmp::min(remaining_capacity, buf.len());
+            self.buffer.extend_from_slice(&buf[..bytes_to_write]);
+            self.cursor += bytes_to_write;
 
-        // Rust needs a little help to borrow self mutably and immutably at the same time
-        // through a Pin.
-        let mut_self = &mut *self;
+            // Rust needs a little help to borrow self mutably and immutably at the same time
+            // through a Pin.
+            let mut_self = &mut *self;
 
-        // Instantiate next request, if available.
-        if mut_self.buffer.capacity() == mut_self.buffer.len() {
-            match &mut mut_self.state {
-                UploadState::Started(store) => {
-                    let path = mut_self.path.clone();
-                    let store = store.clone();
-                    let fut = Box::pin(async move { store.put_multipart(path.as_ref()).await });
-                    self.state = UploadState::CreatingUpload(fut);
-                }
-                UploadState::InProgress {
-                    upload,
-                    part_idx,
-                    futures,
-                    ..
-                } => {
+            // Instantiate next request, if available.
+            if mut_self.buffer.capacity() == mut_self.buffer.len() {
+                match &mut mut_self.state {
+                    UploadState::Started(store) => {
+                        let path = mut_self.path.clone();
+                        let store = store.clone();
+                        let fut = Box::pin(async move { store.put_multipart(path.as_ref()).await });
+                        self.state = UploadState::CreatingUpload(fut);
+                    }
                     // TODO: Make max concurrency configurable from storage options.
-                    if futures.len() < max_upload_parallelism() {
+                    UploadState::InProgress {
+                        upload,
+                        part_idx,
+                        futures,
+                        ..
+                    } if futures.len() < max_upload_parallelism() => {
                         let data = Self::next_part_buffer(
                             &mut mut_self.buffer,
                             *part_idx,
@@ -393,16 +393,31 @@ impl AsyncWrite for ObjectWriter {
                         );
                         *part_idx += 1;
                     }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
 
-        self.poll_tasks(cx)?;
+            self.as_mut().poll_tasks(cx)?;
 
-        match bytes_to_write {
-            0 => Poll::Pending,
-            _ => Poll::Ready(Ok(bytes_to_write)),
+            if bytes_to_write > 0 || buf.is_empty() {
+                return Poll::Ready(Ok(bytes_to_write));
+            }
+
+            // No buffer capacity was available. Pending is only sound when the
+            // poll_tasks call above left a future holding this task's waker:
+            // the upload being created, or a full complement of in-flight
+            // parts. If it instead drained the part futures — they can all
+            // finish between the spawn check and that poll — nothing would
+            // ever wake this task again, so run the spawn check against the
+            // freed slots and retry the write.
+            match &self.state {
+                UploadState::InProgress { futures, .. }
+                    if futures.len() < max_upload_parallelism() =>
+                {
+                    continue;
+                }
+                _ => return Poll::Pending,
+            }
         }
     }
 
@@ -666,6 +681,44 @@ mod tests {
         }
         let res = Writer::shutdown(&mut object_writer).await.unwrap();
         assert_eq!(res.size, buf.len() * 5);
+    }
+
+    #[tokio::test]
+    async fn test_poll_write_progresses_after_uploads_drain() {
+        // Regression test for a lost wakeup: every in-flight part can finish
+        // between poll_write's spawn check and its final poll_tasks call, so
+        // that call drains the JoinSet and leaves no future holding the
+        // task's waker. Deciding Pending from the entry-time buffer capacity
+        // then parks the task forever. poll_write must re-run the spawn
+        // check against the freed slots and accept the bytes instead.
+        let store = LanceObjectStore::memory();
+        let path = Path::from("/lost-wakeup");
+        let mut writer = ObjectWriter::new(&store, &path).await.unwrap();
+
+        // Construct the drained state directly: a live multipart upload with
+        // no in-flight part futures, and a buffer with zero remaining
+        // capacity.
+        let upload = store.inner.put_multipart(&path).await.unwrap();
+        writer.state = UploadState::InProgress {
+            part_idx: 1,
+            upload,
+            futures: JoinSet::new(),
+        };
+        let capacity = writer.buffer.capacity();
+        writer.buffer.resize(capacity, 0);
+        writer.cursor = capacity;
+
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        match Pin::new(&mut writer).poll_write(&mut cx, &[1u8; 1024]) {
+            Poll::Ready(Ok(n)) => assert!(n > 0, "poll_write accepted no bytes"),
+            Poll::Ready(Err(e)) => panic!("poll_write failed: {e}"),
+            Poll::Pending => panic!(
+                "poll_write returned Pending with no in-flight uploads; \
+                 nothing would ever wake the task"
+            ),
+        }
+        writer.abort().await;
     }
 
     #[tokio::test]
