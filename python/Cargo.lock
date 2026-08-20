@@ -6038,7 +6038,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "9.0.1"
+version = "9.0.1+exa.2"
 dependencies = [
  "alloc-stdlib",
  "arrow",
