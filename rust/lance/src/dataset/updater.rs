@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::{RecordBatch, UInt32Array};
+use arrow_array::{RecordBatch, UInt32Array, new_null_array};
 use futures::StreamExt;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch};
 use lance_core::utils::deletion::DeletionVector;
@@ -167,41 +167,102 @@ impl Updater {
 
         // Add back in deleted rows
         let batch = self.deletion_restorer.restore(batch)?;
+        self.write_batches(vec![batch]).await
+    }
 
-        if self.writer.is_none() {
-            if self.write_schema.is_none() {
-                // Need to infer the schema.
-                let output_schema = batch.schema();
-                let mut final_schema = self.fragment.schema().merge(output_schema.as_ref())?;
-                final_schema.set_field_id(Some(self.fragment.dataset().manifest.max_field_id()));
-                self.final_schema = Some(final_schema);
-                self.final_schema.as_ref().unwrap().validate()?;
-                self.write_schema = Some(self.final_schema.as_ref().unwrap().project_by_schema(
-                    output_schema.as_ref(),
-                    OnMissing::Error,
-                    OnTypeMismatch::Error,
-                )?);
-            }
+    /// Update multiple batches without concatenating them.
+    ///
+    /// V2 writers can preserve the input batch boundaries all the way through
+    /// the data writer, avoiding Arrow's 32-bit offset limit when a logical
+    /// updater read batch contains more than 2 GiB of variable-width values.
+    pub async fn update_batches(&mut self, batches: Vec<RecordBatch>) -> Result<()> {
+        let Some(last) = self.last_input.as_ref() else {
+            return Err(Error::invalid_input(
+                "Fragment Updater: no input data is available before update".to_string(),
+            ));
+        };
 
-            self.writer = Some(
-                self.new_writer(self.write_schema.as_ref().unwrap().clone())
-                    .await?,
-            );
+        if batches.is_empty() {
+            return Err(Error::invalid_input(
+                "Fragment Updater: cannot update with an empty batch list".to_string(),
+            ));
         }
+
+        let total_rows = batches
+            .iter()
+            .try_fold(0usize, |total, batch| total.checked_add(batch.num_rows()))
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    "Fragment Updater: input batch row count overflowed usize".to_string(),
+                )
+            })?;
+        if last.num_rows() != total_rows {
+            return Err(Error::invalid_input(format!(
+                "Fragment Updater: new batches have different size with the source batch: {} != {}",
+                last.num_rows(),
+                total_rows
+            )));
+        }
+
+        if self.deletion_restorer.legacy_batch_size.is_some() {
+            // Legacy row groups must be restored as whole batches so that
+            // DeletionRestorer can validate each output against its row-group size.
+            let batch = arrow_select::concat::concat_batches(&batches[0].schema(), batches.iter())?;
+            return self.update(batch).await;
+        }
+
+        let mut restored_batches = Vec::with_capacity(batches.len());
+        for batch in batches {
+            restored_batches.push(self.deletion_restorer.restore(batch)?);
+        }
+        self.write_batches(restored_batches).await
+    }
+
+    async fn write_batches(&mut self, batches: Vec<RecordBatch>) -> Result<()> {
+        debug_assert!(!batches.is_empty());
+        self.ensure_writer(&batches[0]).await?;
 
         let schema_adapter = if let Some(schema_adapter) = self.schema_adapter.as_ref() {
             schema_adapter
         } else {
-            self.schema_adapter = Some(SchemaAdapter::new(batch.schema()));
+            self.schema_adapter = Some(SchemaAdapter::new(batches[0].schema()));
             self.schema_adapter.as_ref().unwrap()
         };
 
-        let batch = schema_adapter.to_physical_batch(batch)?;
+        let batches = batches
+            .into_iter()
+            .map(|batch| schema_adapter.to_physical_batch(batch))
+            .collect::<Result<Vec<_>>>()?;
 
         let writer = self.writer.as_mut().unwrap();
+        writer.write(&batches).await?;
 
-        writer.write(&[batch]).await?;
+        Ok(())
+    }
 
+    async fn ensure_writer(&mut self, batch: &RecordBatch) -> Result<()> {
+        if self.writer.is_some() {
+            return Ok(());
+        }
+
+        if self.write_schema.is_none() {
+            // Need to infer the schema.
+            let output_schema = batch.schema();
+            let mut final_schema = self.fragment.schema().merge(output_schema.as_ref())?;
+            final_schema.set_field_id(Some(self.fragment.dataset().manifest.max_field_id()));
+            self.final_schema = Some(final_schema);
+            self.final_schema.as_ref().unwrap().validate()?;
+            self.write_schema = Some(self.final_schema.as_ref().unwrap().project_by_schema(
+                output_schema.as_ref(),
+                OnMissing::Error,
+                OnTypeMismatch::Error,
+            )?);
+        }
+
+        self.writer = Some(
+            self.new_writer(self.write_schema.as_ref().unwrap().clone())
+                .await?,
+        );
         Ok(())
     }
 
@@ -391,11 +452,13 @@ pub(crate) fn add_blanks(batch: RecordBatch, batch_offsets: &[u32]) -> Result<Re
     }
 
     if batch.num_rows() == 0 {
-        // TODO: implement adding blanks for an empty batch.
-        // This is difficult because we need to create a batch for arbitrary schemas.
-        return Err(Error::not_supported_source(
-            "Missing too many rows in merge, run compaction to materialize deletions first".into(),
-        ));
+        let columns = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| new_null_array(field.data_type(), batch_offsets.len()))
+            .collect();
+        return RecordBatch::try_new(batch.schema(), columns).map_err(Into::into);
     }
 
     let mut selection_vector = Vec::<u32>::with_capacity(batch.num_rows() + batch_offsets.len());
@@ -430,9 +493,15 @@ pub(crate) fn add_blanks(batch: RecordBatch, batch_offsets: &[u32]) -> Result<Re
 #[cfg(test)]
 mod tests {
     use arrow::{array::AsArray, datatypes::Int32Type};
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_datagen::RowCount;
+    use lance_encoding::version::LanceFileVersion;
+    use std::sync::Arc;
 
     use super::add_blanks;
+    use crate::Error;
+    use crate::dataset::{Dataset, WriteParams};
 
     #[test]
     fn test_restore_deletes() {
@@ -505,5 +574,118 @@ mod tests {
             assert_eq!(values.value(i), (i - 1) as i32);
         }
         assert_eq!(values.value(11), 0);
+    }
+
+    #[tokio::test]
+    async fn test_update_batches_rejects_row_count_mismatch() -> crate::Result<()> {
+        let source_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "source",
+            DataType::Int32,
+            false,
+        )]));
+        let source_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![0, 1, 2, 3]))],
+        )?;
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(source_batch)], source_schema),
+            "memory://updater-row-count-mismatch",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let fragment = dataset
+            .get_fragments()
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::invalid_input("test dataset has no fragments"))?;
+        let mut updater = fragment.updater::<String>(None, None, None).await?;
+        let _ = updater.next().await?;
+
+        let output_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "output",
+            DataType::Int32,
+            false,
+        )]));
+        let output = RecordBatch::try_new(
+            output_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![10, 11]))],
+        )?;
+        let error = updater
+            .update_batches(vec![])
+            .await
+            .expect_err("empty batch lists must be rejected");
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot update with an empty batch list")
+        );
+
+        let error = updater
+            .update_batches(vec![output])
+            .await
+            .expect_err("row-count mismatch must be rejected");
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("new batches have different size with the source batch: 4 != 2")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_batches_legacy_delegates_to_single_batch_update() -> crate::Result<()> {
+        let source_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "source",
+            DataType::Int32,
+            false,
+        )]));
+        let source_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![0, 1, 2, 3]))],
+        )?;
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(source_batch)], source_schema),
+            "memory://updater-legacy-batches",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let fragment = dataset
+            .get_fragments()
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::invalid_input("test dataset has no fragments"))?;
+        let mut updater = fragment.updater::<String>(None, None, None).await?;
+        let input = updater
+            .next()
+            .await?
+            .ok_or_else(|| Error::invalid_input("legacy updater did not yield its input batch"))?;
+        assert_eq!(input.num_rows(), 4);
+
+        let output_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "output",
+            DataType::Int32,
+            false,
+        )]));
+        let output = RecordBatch::try_new(
+            output_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![10, 11, 12, 13]))],
+        )?;
+        updater
+            .update_batches(vec![output.slice(0, 2), output.slice(2, 2)])
+            .await?;
+        let updated_fragment = updater.finish().await?;
+        assert_eq!(updated_fragment.files.len(), 2);
+        Ok(())
     }
 }
