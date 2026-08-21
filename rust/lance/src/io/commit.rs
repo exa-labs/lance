@@ -174,7 +174,7 @@ async fn do_commit_new_dataset(
             (new_manifest, updated_indices)
         } else {
             // Deep clone: build a manifest that references local files (no external bases)
-            let mut new_manifest = source_manifest.clone();
+            let mut new_manifest = source_manifest.as_ref().clone();
             new_manifest.base_paths.clear();
             new_manifest.branch = None;
             new_manifest.tag = None;
