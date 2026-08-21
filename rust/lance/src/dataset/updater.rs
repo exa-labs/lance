@@ -452,6 +452,19 @@ pub(crate) fn add_blanks(batch: RecordBatch, batch_offsets: &[u32]) -> Result<Re
     }
 
     if batch.num_rows() == 0 {
+        if batch
+            .schema()
+            .fields()
+            .iter()
+            .any(|field| !field.is_nullable())
+        {
+            return Err(Error::not_supported_source(
+                "Missing too many rows in merge, run compaction to materialize deletions first"
+                    .into(),
+            ));
+        }
+        // Deleted rows need placeholder values to preserve row alignment. These
+        // blanks are never surfaced by scans because the rows are deleted.
         let columns = batch
             .schema()
             .fields()
@@ -574,6 +587,24 @@ mod tests {
             assert_eq!(values.value(i), (i - 1) as i32);
         }
         assert_eq!(values.value(11), 0);
+    }
+
+    #[test]
+    fn test_add_blanks_rejects_non_nullable_empty_batch() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "x",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::new_empty(schema);
+
+        let error = add_blanks(batch, &[0]).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("run compaction to materialize deletions first")
+        );
     }
 
     #[tokio::test]

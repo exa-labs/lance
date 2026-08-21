@@ -1253,7 +1253,7 @@ mod test {
         Ok(())
     }
 
-    #[ignore = "requires ~5 GiB RAM; run manually (the fork has issues disabled)"]
+    #[ignore = "requires ~5 GiB RAM; run manually"]
     #[tokio::test]
     async fn test_add_columns_binary_column_over_2gib() -> Result<()> {
         const NUM_ROWS: usize = 1_100;
