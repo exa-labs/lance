@@ -1003,6 +1003,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_merge_preserves_visible_rows_with_deletions() -> crate::Result<()> {
+        let source_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("payload", DataType::Binary, false),
+        ]));
+        let source_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2])),
+                Arc::new(BinaryArray::from(vec![
+                    b"zero".as_ref(),
+                    b"deleted".as_ref(),
+                    b"two".as_ref(),
+                ])),
+            ],
+        )?;
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(source_batch)], source_schema),
+            "memory://updater-merge-deletions",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        dataset.delete("id = 1").await?;
+        let before_merge = dataset.scan().try_into_batch().await?;
+
+        let right_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("metadata", DataType::Utf8, true),
+        ]));
+        let right_batch = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 2])),
+                Arc::new(StringArray::from(vec!["first", "last"])),
+            ],
+        )?;
+        dataset
+            .merge(
+                RecordBatchIterator::new(vec![Ok(right_batch)], right_schema),
+                "id",
+                "id",
+            )
+            .await?;
+        let mut scan = dataset.scan();
+        let after_merge = scan.project(&["id", "payload"]).unwrap();
+        let after_merge = after_merge.try_into_batch().await?;
+
+        assert_eq!(before_merge, after_merge);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_update_batches_legacy_delegates_to_single_batch_update() -> crate::Result<()> {
         let source_schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "source",
