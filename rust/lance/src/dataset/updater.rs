@@ -1,7 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::{RecordBatch, UInt32Array, new_null_array};
+use std::sync::Arc;
+
+use arrow_array::types::{self, ArrowPrimitiveType};
+use arrow_array::{
+    ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray,
+    LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, MapArray, PrimitiveArray,
+    RecordBatch, StringArray, StructArray, new_empty_array, new_null_array,
+};
+use arrow_buffer::{Buffer, OffsetBuffer};
+use arrow_schema::DataType;
 use futures::StreamExt;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch};
 use lance_core::utils::deletion::DeletionVector;
@@ -474,27 +483,35 @@ pub(crate) fn add_blanks(batch: RecordBatch, batch_offsets: &[u32]) -> Result<Re
         return RecordBatch::try_new(batch.schema(), columns).map_err(Into::into);
     }
 
-    let mut selection_vector = Vec::<u32>::with_capacity(batch.num_rows() + batch_offsets.len());
+    let blank_columns = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| blank_array(field.data_type(), field.is_nullable(), 1))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut indices = Vec::with_capacity(batch.num_rows() + batch_offsets.len());
     let mut batch_pos = 0;
     let mut next_id = 0;
     for batch_offset in batch_offsets {
         let num_rows = *batch_offset - next_id;
-        selection_vector.extend(batch_pos..batch_pos + num_rows);
-        // For simplicity, we just use the first value for deleted rows
-        // TODO: optimize this to use small value for each column.
-        selection_vector.push(0);
+        indices.extend((batch_pos..batch_pos + num_rows).map(|row| (0, row as usize)));
+        indices.push((1, 0));
         next_id = *batch_offset + 1;
         batch_pos += num_rows;
     }
-    selection_vector.extend(batch_pos..batch.num_rows() as u32);
-    let selection_vector = UInt32Array::from(selection_vector);
+    indices.extend((batch_pos..batch.num_rows() as u32).map(|row| (0, row as usize)));
 
     let arrays = batch
         .columns()
         .iter()
-        .map(|array| {
-            arrow::compute::take(array.as_ref(), &selection_vector, None)
-                .map_err(|e| Error::arrow(format!("Failed to add blanks: {}", e)))
+        .zip(blank_columns)
+        .map(|(array, blank)| {
+            arrow_select::interleave::interleave(
+                &[array.as_ref(), blank.as_ref()],
+                indices.as_ref(),
+            )
+            .map_err(|e| Error::arrow(format!("Failed to add blanks: {}", e)))
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -503,10 +520,187 @@ pub(crate) fn add_blanks(batch: RecordBatch, batch_offsets: &[u32]) -> Result<Re
     Ok(batch)
 }
 
+fn blank_array(data_type: &DataType, nullable: bool, len: usize) -> Result<ArrayRef> {
+    if nullable {
+        return Ok(new_null_array(data_type, len));
+    }
+
+    macro_rules! primitive {
+        ($type:ty) => {
+            Ok(Arc::new(
+                PrimitiveArray::<$type>::from_value(
+                    <$type as ArrowPrimitiveType>::default_value(),
+                    len,
+                )
+                .with_data_type(data_type.clone()),
+            ))
+        };
+    }
+
+    match data_type {
+        DataType::Null => Ok(new_null_array(data_type, len)),
+        DataType::Boolean => Ok(Arc::new(BooleanArray::from(vec![false; len]))),
+        DataType::Int8 => primitive!(types::Int8Type),
+        DataType::Int16 => primitive!(types::Int16Type),
+        DataType::Int32 => primitive!(types::Int32Type),
+        DataType::Int64 => primitive!(types::Int64Type),
+        DataType::UInt8 => primitive!(types::UInt8Type),
+        DataType::UInt16 => primitive!(types::UInt16Type),
+        DataType::UInt32 => primitive!(types::UInt32Type),
+        DataType::UInt64 => primitive!(types::UInt64Type),
+        DataType::Float16 => primitive!(types::Float16Type),
+        DataType::Float32 => primitive!(types::Float32Type),
+        DataType::Float64 => primitive!(types::Float64Type),
+        DataType::Decimal32(_, _) => primitive!(types::Decimal32Type),
+        DataType::Decimal64(_, _) => primitive!(types::Decimal64Type),
+        DataType::Decimal128(_, _) => primitive!(types::Decimal128Type),
+        DataType::Decimal256(_, _) => primitive!(types::Decimal256Type),
+        DataType::Date32 => primitive!(types::Date32Type),
+        DataType::Date64 => primitive!(types::Date64Type),
+        DataType::Time32(arrow_schema::TimeUnit::Second) => primitive!(types::Time32SecondType),
+        DataType::Time32(arrow_schema::TimeUnit::Millisecond) => {
+            primitive!(types::Time32MillisecondType)
+        }
+        DataType::Time64(arrow_schema::TimeUnit::Microsecond) => {
+            primitive!(types::Time64MicrosecondType)
+        }
+        DataType::Time64(arrow_schema::TimeUnit::Nanosecond) => {
+            primitive!(types::Time64NanosecondType)
+        }
+        DataType::Timestamp(arrow_schema::TimeUnit::Second, _) => {
+            primitive!(types::TimestampSecondType)
+        }
+        DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, _) => {
+            primitive!(types::TimestampMillisecondType)
+        }
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _) => {
+            primitive!(types::TimestampMicrosecondType)
+        }
+        DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, _) => {
+            primitive!(types::TimestampNanosecondType)
+        }
+        DataType::Interval(arrow_schema::IntervalUnit::YearMonth) => {
+            primitive!(types::IntervalYearMonthType)
+        }
+        DataType::Interval(arrow_schema::IntervalUnit::DayTime) => {
+            primitive!(types::IntervalDayTimeType)
+        }
+        DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano) => {
+            primitive!(types::IntervalMonthDayNanoType)
+        }
+        DataType::Duration(arrow_schema::TimeUnit::Second) => primitive!(types::DurationSecondType),
+        DataType::Duration(arrow_schema::TimeUnit::Millisecond) => {
+            primitive!(types::DurationMillisecondType)
+        }
+        DataType::Duration(arrow_schema::TimeUnit::Microsecond) => {
+            primitive!(types::DurationMicrosecondType)
+        }
+        DataType::Duration(arrow_schema::TimeUnit::Nanosecond) => {
+            primitive!(types::DurationNanosecondType)
+        }
+        DataType::Utf8 => Ok(Arc::new(StringArray::from(
+            std::iter::repeat_n("", len).collect::<Vec<_>>(),
+        ))),
+        DataType::LargeUtf8 => Ok(Arc::new(LargeStringArray::from(
+            std::iter::repeat_n("", len).collect::<Vec<_>>(),
+        ))),
+        DataType::Utf8View => Ok(Arc::new(arrow_array::StringViewArray::from(
+            std::iter::repeat_n("", len).collect::<Vec<_>>(),
+        ))),
+        DataType::Binary => Ok(Arc::new(BinaryArray::from(
+            std::iter::repeat_n(b"".as_ref(), len).collect::<Vec<_>>(),
+        ))),
+        DataType::LargeBinary => Ok(Arc::new(LargeBinaryArray::from(
+            std::iter::repeat_n(b"".as_ref(), len).collect::<Vec<_>>(),
+        ))),
+        DataType::BinaryView => Ok(Arc::new(arrow_array::BinaryViewArray::from(
+            std::iter::repeat_n(b"".as_ref(), len).collect::<Vec<_>>(),
+        ))),
+        DataType::FixedSizeBinary(size) => {
+            let size = usize::try_from(*size).map_err(|_| {
+                Error::invalid_input(format!("Invalid fixed-size binary width: {size}"))
+            })?;
+            let values = vec![
+                0;
+                size.checked_mul(len).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "Fixed-size binary buffer size overflow: {size} * {len}"
+                    ))
+                })?
+            ];
+            Ok(Arc::new(FixedSizeBinaryArray::new(
+                size as i32,
+                Buffer::from(values),
+                None,
+            )))
+        }
+        DataType::List(field) => Ok(Arc::new(ListArray::new(
+            field.clone(),
+            OffsetBuffer::new_zeroed(len + 1),
+            new_empty_array(field.data_type()),
+            None,
+        ))),
+        DataType::LargeList(field) => Ok(Arc::new(LargeListArray::new(
+            field.clone(),
+            OffsetBuffer::new_zeroed(len + 1),
+            new_empty_array(field.data_type()),
+            None,
+        ))),
+        DataType::FixedSizeList(field, size) => {
+            let size = usize::try_from(*size).map_err(|_| {
+                Error::invalid_input(format!("Invalid fixed-size list width: {size}"))
+            })?;
+            Ok(Arc::new(FixedSizeListArray::new(
+                field.clone(),
+                size as i32,
+                blank_array(
+                    field.data_type(),
+                    field.is_nullable(),
+                    size.checked_mul(len).ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "Fixed-size list value count overflow: {size} * {len}"
+                        ))
+                    })?,
+                )?,
+                None,
+            )))
+        }
+        DataType::Struct(fields) => Ok(Arc::new(StructArray::new(
+            fields.clone(),
+            fields
+                .iter()
+                .map(|field| blank_array(field.data_type(), field.is_nullable(), len))
+                .collect::<Result<Vec<_>>>()?,
+            None,
+        ))),
+        DataType::Map(field, ordered) => {
+            let entries = blank_array(field.data_type(), false, 0)?;
+            let entries = entries
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| Error::invalid_input("Map entries must be a struct"))?
+                .clone();
+            Ok(Arc::new(MapArray::new(
+                field.clone(),
+                OffsetBuffer::new_zeroed(len + 1),
+                entries,
+                None,
+                *ordered,
+            )))
+        }
+        _ => Err(Error::not_supported_source(
+            format!("Cannot construct blank value for Arrow data type {data_type:?}").into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arrow::{array::AsArray, datatypes::Int32Type};
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_array::{
+        Array, BinaryArray, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator,
+        StringArray, StructArray,
+    };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_datagen::RowCount;
     use lance_encoding::version::LanceFileVersion;
@@ -587,6 +781,126 @@ mod tests {
             assert_eq!(values.value(i), (i - 1) as i32);
         }
         assert_eq!(values.value(11), 0);
+    }
+
+    #[test]
+    fn test_add_blanks_uses_type_appropriate_values() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("nullable_int", DataType::Int32, true),
+            Field::new("required_int", DataType::Int32, false),
+            Field::new("nullable_binary", DataType::Binary, true),
+            Field::new("required_binary", DataType::Binary, false),
+            Field::new("nullable_string", DataType::Utf8, true),
+            Field::new("required_string", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(BinaryArray::from(vec![
+                    Some(b"one".as_ref()),
+                    Some(b"two".as_ref()),
+                ])),
+                Arc::new(BinaryArray::from(vec![b"one".as_ref(), b"two".as_ref()])),
+                Arc::new(StringArray::from(vec![Some("one"), Some("two")])),
+                Arc::new(StringArray::from(vec!["one", "two"])),
+            ],
+        )
+        .unwrap();
+
+        let with_blanks = add_blanks(batch, &[1]).unwrap();
+        assert!(with_blanks.column(0).is_null(1));
+        assert_eq!(
+            with_blanks.column(1).as_primitive::<Int32Type>().value(1),
+            0
+        );
+        assert!(with_blanks.column(2).is_null(1));
+        assert_eq!(with_blanks.column(3).as_binary::<i32>().value(1), b"");
+        assert!(with_blanks.column(4).is_null(1));
+        assert_eq!(with_blanks.column(5).as_string::<i32>().value(1), "");
+    }
+
+    #[test]
+    fn test_add_blanks_does_not_duplicate_large_variable_width_values() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "value",
+            DataType::Binary,
+            false,
+        )]));
+        let large_value = vec![42; 1024 * 1024];
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(BinaryArray::from(vec![large_value.as_slice()]))],
+        )
+        .unwrap();
+        let deleted_rows = 100_000;
+        let offsets = (0..deleted_rows as u32).collect::<Vec<_>>();
+
+        let with_blanks = add_blanks(batch, &offsets).unwrap();
+        let values = with_blanks.column(0).as_binary::<i32>();
+        assert_eq!(values.len(), deleted_rows + 1);
+        assert_eq!(values.value(deleted_rows), large_value.as_slice());
+        assert_eq!(values.value_data().len(), large_value.len());
+    }
+
+    #[test]
+    fn test_add_blanks_recursively_constructs_nested_values() {
+        let struct_fields = vec![
+            Arc::new(Field::new("number", DataType::Int32, false)),
+            Arc::new(Field::new("text", DataType::Utf8, false)),
+        ];
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "nested",
+            DataType::Struct(struct_fields.clone().into()),
+            false,
+        )]));
+        let nested = StructArray::new(
+            struct_fields.into(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as arrow_array::ArrayRef,
+                Arc::new(StringArray::from(vec!["one", "two"])) as arrow_array::ArrayRef,
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(nested)]).unwrap();
+
+        let with_blanks = add_blanks(batch, &[1]).unwrap();
+        let nested = with_blanks
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(nested.column(0).as_primitive::<Int32Type>().value(1), 0);
+        assert_eq!(nested.column(1).as_string::<i32>().value(1), "");
+    }
+
+    #[test]
+    fn test_add_blanks_constructs_fixed_size_list_values() {
+        let item_field = Arc::new(Field::new("item", DataType::Int32, false));
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "nested",
+            DataType::FixedSizeList(item_field.clone(), 2),
+            false,
+        )]));
+        let nested = FixedSizeListArray::new(
+            item_field,
+            2,
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+            None,
+        );
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(nested)]).unwrap();
+
+        let with_blanks = add_blanks(batch, &[1]).unwrap();
+        let nested = with_blanks
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        let nested_value = nested.value(1);
+        let values = nested_value.as_primitive::<Int32Type>();
+        assert_eq!(values.value(0), 0);
+        assert_eq!(values.value(1), 0);
     }
 
     #[test]
