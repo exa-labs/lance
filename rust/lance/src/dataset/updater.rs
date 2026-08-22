@@ -9,7 +9,7 @@ use arrow_array::{
     LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, MapArray, PrimitiveArray,
     RecordBatch, StringArray, StructArray, new_empty_array, new_null_array,
 };
-use arrow_buffer::{Buffer, OffsetBuffer};
+use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::DataType;
 use futures::StreamExt;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch};
@@ -631,7 +631,7 @@ fn blank_array(data_type: &DataType, nullable: bool, len: usize) -> Result<Array
             Ok(Arc::new(FixedSizeBinaryArray::new(
                 size as i32,
                 Buffer::from(values),
-                None,
+                Some(NullBuffer::new_valid(len)),
             )))
         }
         DataType::List(field) => Ok(Arc::new(ListArray::new(
@@ -698,8 +698,8 @@ fn blank_array(data_type: &DataType, nullable: bool, len: usize) -> Result<Array
 mod tests {
     use arrow::{array::AsArray, datatypes::Int32Type};
     use arrow_array::{
-        Array, BinaryArray, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator,
-        StringArray, StructArray,
+        Array, BinaryArray, FixedSizeBinaryArray, FixedSizeListArray, Int32Array, RecordBatch,
+        RecordBatchIterator, StringArray, StructArray,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_datagen::RowCount;
@@ -901,6 +901,24 @@ mod tests {
         let values = nested_value.as_primitive::<Int32Type>();
         assert_eq!(values.value(0), 0);
         assert_eq!(values.value(1), 0);
+    }
+
+    #[test]
+    fn test_add_blanks_constructs_zero_width_fixed_size_binary_values() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "value",
+            DataType::FixedSizeBinary(0),
+            false,
+        )]));
+        let values = FixedSizeBinaryArray::new(
+            0,
+            arrow_buffer::Buffer::from(Vec::<u8>::new()),
+            Some(arrow_buffer::NullBuffer::new_valid(2)),
+        );
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap();
+
+        let with_blanks = add_blanks(batch, &[1]).unwrap();
+        assert_eq!(with_blanks.column(0).len(), 3);
     }
 
     #[test]
