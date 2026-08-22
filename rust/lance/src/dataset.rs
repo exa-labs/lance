@@ -1687,6 +1687,17 @@ impl Dataset {
         Ok(store)
     }
 
+    /// Get the ObjectStore holding a deletion file, considering its base_id.
+    pub(crate) async fn object_store_for_deletion(
+        &self,
+        deletion_file: &DeletionFile,
+    ) -> Result<Arc<ObjectStore>> {
+        match deletion_file.base_id.as_ref() {
+            Some(base_id) => self.object_store_for_base(*base_id).await,
+            None => Ok(self.object_store.clone()),
+        }
+    }
+
     pub(crate) fn dataset_dir_for_deletion(&self, deletion_file: &DeletionFile) -> Result<Path> {
         match deletion_file.base_id.as_ref() {
             Some(base_id) => {
