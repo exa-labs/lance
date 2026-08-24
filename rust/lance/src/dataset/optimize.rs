@@ -94,7 +94,7 @@ use super::transaction::{
     Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
 use super::utils::make_rowid_capture_stream;
-use super::{WriteMode, WriteParams, cleanup_data_fragments, write_fragments_internal};
+use super::{WriteMode, WriteParams, write_fragments_internal};
 use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
@@ -1800,14 +1800,12 @@ async fn rewrite_files(
     }
     .await;
 
-    let row_addrs = match row_addrs_result {
-        Ok(v) => v,
-        Err(e) => {
-            cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &new_fragments)
-                .await;
-            return Err(e);
-        }
-    };
+    // A failed task leaves its freshly written, never-committed files behind
+    // as orphans for vacuum/`cleanup_old_versions` to reclaim. Compaction
+    // itself never deletes data files: any inline delete that misjudges
+    // whether a file is live destroys committed data, while an orphan only
+    // costs storage until the next vacuum pass.
+    let row_addrs = row_addrs_result?;
 
     metrics.files_removed = task
         .fragments
@@ -2199,13 +2197,6 @@ pub async fn commit_compaction(
         None
     };
 
-    // Collect new fragment paths before moving rewrite_groups into the transaction,
-    // so we can clean them up if the commit fails.
-    let all_new_fragments: Vec<Fragment> = rewrite_groups
-        .iter()
-        .flat_map(|g| g.new_fragments.iter().cloned())
-        .collect();
-
     let transaction = TransactionBuilder::new(
         // Use the version at which the compaction tasks were *planned*, not the
         // version of the dataset handle passed to this function.  In distributed
@@ -2224,33 +2215,16 @@ pub async fn commit_compaction(
     .transaction_properties(options.transaction_properties.clone())
     .build();
 
-    if let Err(e) = dataset
+    // Never delete the new data files on a failed commit. A conflict error is
+    // ambiguous: in distributed mode a redelivered batch may have already been
+    // committed by a previous incarnation of the committer, in which case
+    // these exact files are referenced by the manifest tip and deleting them
+    // destroys live data. Even non-conflict failures leave the files as
+    // never-committed orphans for vacuum/`cleanup_old_versions` to reclaim —
+    // compaction itself performs no data-file deletion.
+    dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
-        .await
-    {
-        // Only delete the new data files when the commit definitely never
-        // published them. A conflict error is ambiguous: in distributed mode a
-        // redelivered batch may have already been committed by a previous
-        // incarnation of the committer, in which case these exact files are
-        // referenced by the manifest tip and deleting them destroys live data.
-        // Conflicted files are left for orphan cleanup instead.
-        let commit_may_have_published = matches!(
-            e,
-            Error::CommitConflict { .. }
-                | Error::RetryableCommitConflict { .. }
-                | Error::TooMuchWriteContention { .. }
-        );
-        if !commit_may_have_published {
-            cleanup_data_fragments(
-                &dataset.object_store,
-                &dataset.base,
-                None,
-                &all_new_fragments,
-            )
-            .await;
-        }
-        return Err(e);
-    }
+        .await?;
 
     Ok(metrics)
 }
