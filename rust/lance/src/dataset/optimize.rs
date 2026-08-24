@@ -2228,13 +2228,27 @@ pub async fn commit_compaction(
         .apply_commit(transaction, &Default::default(), &Default::default())
         .await
     {
-        cleanup_data_fragments(
-            &dataset.object_store,
-            &dataset.base,
-            None,
-            &all_new_fragments,
-        )
-        .await;
+        // Only delete the new data files when the commit definitely never
+        // published them. A conflict error is ambiguous: in distributed mode a
+        // redelivered batch may have already been committed by a previous
+        // incarnation of the committer, in which case these exact files are
+        // referenced by the manifest tip and deleting them destroys live data.
+        // Conflicted files are left for orphan cleanup instead.
+        let commit_may_have_published = matches!(
+            e,
+            Error::CommitConflict { .. }
+                | Error::RetryableCommitConflict { .. }
+                | Error::TooMuchWriteContention { .. }
+        );
+        if !commit_may_have_published {
+            cleanup_data_fragments(
+                &dataset.object_store,
+                &dataset.base,
+                None,
+                &all_new_fragments,
+            )
+            .await;
+        }
         return Err(e);
     }
 
@@ -6954,6 +6968,86 @@ mod tests {
             row_count, 0,
             "rows deleted before compaction must not be resurrected; found {row_count}"
         );
+    }
+
+    /// A redelivered rewrite batch (at-least-once delivery) may already have
+    /// been committed by a previous incarnation of the committer. The retried
+    /// `commit_compaction` fails with a conflict, and the failure cleanup must
+    /// NOT delete the batch's output files: they are the live data files
+    /// referenced by the manifest tip.
+    #[tokio::test]
+    async fn test_recommit_conflict_does_not_delete_published_files() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..4_000))],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 10_000,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        let results: Vec<RewriteResult> = futures::stream::iter(plan.compaction_tasks())
+            .then(|task| {
+                let ds = dataset.clone();
+                async move { task.execute(&ds).await.unwrap() }
+            })
+            .collect()
+            .await;
+
+        // First commit publishes the rewrite outputs into the manifest tip.
+        let mut dataset_commit = Dataset::open(test_uri).await.unwrap();
+        commit_compaction(
+            &mut dataset_commit,
+            results.clone(),
+            Arc::new(IgnoreRemap::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        let files_after_commit = count_data_files_in(test_uri.as_str());
+        let rows_after_commit = dataset_commit.count_rows(None).await.unwrap();
+
+        // Redelivery: a successor committer retries the exact same batch.
+        let mut dataset_retry = Dataset::open(test_uri).await.unwrap();
+        let err = commit_compaction(
+            &mut dataset_retry,
+            results,
+            Arc::new(IgnoreRemap::default()),
+            &options,
+        )
+        .await
+        .expect_err("recommitting an already-committed batch must fail");
+        assert!(
+            matches!(
+                err,
+                Error::RetryableCommitConflict { .. } | Error::CommitConflict { .. }
+            ),
+            "unexpected error: {err}"
+        );
+
+        assert_eq!(
+            count_data_files_in(test_uri.as_str()),
+            files_after_commit,
+            "conflict cleanup must not delete published data files"
+        );
+        let latest = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(latest.count_rows(None).await.unwrap(), rows_after_commit);
     }
 
     fn count_all_files_in(dir: &std::path::Path) -> std::io::Result<usize> {
