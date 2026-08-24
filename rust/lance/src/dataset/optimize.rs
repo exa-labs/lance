@@ -94,7 +94,7 @@ use super::transaction::{
     Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
 use super::utils::make_rowid_capture_stream;
-use super::{WriteMode, WriteParams, cleanup_data_fragments, write_fragments_internal};
+use super::{WriteMode, WriteParams, write_fragments_internal};
 use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
@@ -1800,14 +1800,12 @@ async fn rewrite_files(
     }
     .await;
 
-    let row_addrs = match row_addrs_result {
-        Ok(v) => v,
-        Err(e) => {
-            cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &new_fragments)
-                .await;
-            return Err(e);
-        }
-    };
+    // A failed task leaves its freshly written, never-committed files behind
+    // as orphans for vacuum/`cleanup_old_versions` to reclaim. Compaction
+    // itself never deletes data files: any inline delete that misjudges
+    // whether a file is live destroys committed data, while an orphan only
+    // costs storage until the next vacuum pass.
+    let row_addrs = row_addrs_result?;
 
     metrics.files_removed = task
         .fragments
@@ -2199,13 +2197,6 @@ pub async fn commit_compaction(
         None
     };
 
-    // Collect new fragment paths before moving rewrite_groups into the transaction,
-    // so we can clean them up if the commit fails.
-    let all_new_fragments: Vec<Fragment> = rewrite_groups
-        .iter()
-        .flat_map(|g| g.new_fragments.iter().cloned())
-        .collect();
-
     let transaction = TransactionBuilder::new(
         // Use the version at which the compaction tasks were *planned*, not the
         // version of the dataset handle passed to this function.  In distributed
@@ -2224,19 +2215,16 @@ pub async fn commit_compaction(
     .transaction_properties(options.transaction_properties.clone())
     .build();
 
-    if let Err(e) = dataset
+    // Never delete the new data files on a failed commit. A conflict error is
+    // ambiguous: in distributed mode a redelivered batch may have already been
+    // committed by a previous incarnation of the committer, in which case
+    // these exact files are referenced by the manifest tip and deleting them
+    // destroys live data. Even non-conflict failures leave the files as
+    // never-committed orphans for vacuum/`cleanup_old_versions` to reclaim —
+    // compaction itself performs no data-file deletion.
+    dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
-        .await
-    {
-        cleanup_data_fragments(
-            &dataset.object_store,
-            &dataset.base,
-            None,
-            &all_new_fragments,
-        )
-        .await;
-        return Err(e);
-    }
+        .await?;
 
     Ok(metrics)
 }
@@ -6954,6 +6942,86 @@ mod tests {
             row_count, 0,
             "rows deleted before compaction must not be resurrected; found {row_count}"
         );
+    }
+
+    /// A redelivered rewrite batch (at-least-once delivery) may already have
+    /// been committed by a previous incarnation of the committer. The retried
+    /// `commit_compaction` fails with a conflict, and the failure cleanup must
+    /// NOT delete the batch's output files: they are the live data files
+    /// referenced by the manifest tip.
+    #[tokio::test]
+    async fn test_recommit_conflict_does_not_delete_published_files() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..4_000))],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 10_000,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        let results: Vec<RewriteResult> = futures::stream::iter(plan.compaction_tasks())
+            .then(|task| {
+                let ds = dataset.clone();
+                async move { task.execute(&ds).await.unwrap() }
+            })
+            .collect()
+            .await;
+
+        // First commit publishes the rewrite outputs into the manifest tip.
+        let mut dataset_commit = Dataset::open(test_uri).await.unwrap();
+        commit_compaction(
+            &mut dataset_commit,
+            results.clone(),
+            Arc::new(IgnoreRemap::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        let files_after_commit = count_data_files_in(test_uri.as_str());
+        let rows_after_commit = dataset_commit.count_rows(None).await.unwrap();
+
+        // Redelivery: a successor committer retries the exact same batch.
+        let mut dataset_retry = Dataset::open(test_uri).await.unwrap();
+        let err = commit_compaction(
+            &mut dataset_retry,
+            results,
+            Arc::new(IgnoreRemap::default()),
+            &options,
+        )
+        .await
+        .expect_err("recommitting an already-committed batch must fail");
+        assert!(
+            matches!(
+                err,
+                Error::RetryableCommitConflict { .. } | Error::CommitConflict { .. }
+            ),
+            "unexpected error: {err}"
+        );
+
+        assert_eq!(
+            count_data_files_in(test_uri.as_str()),
+            files_after_commit,
+            "conflict cleanup must not delete published data files"
+        );
+        let latest = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(latest.count_rows(None).await.unwrap(), rows_after_commit);
     }
 
     fn count_all_files_in(dir: &std::path::Path) -> std::io::Result<usize> {
