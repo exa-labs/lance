@@ -7052,12 +7052,15 @@ mod tests {
         count_all_files_in(&data_dir).unwrap_or(0)
     }
 
-    /// Site 2 in PR #6320: when `commit_compaction` fails to apply the commit
-    /// after `rewrite_files` has already written new data files, those files
-    /// must be cleaned up. We force the commit failure by injecting an error on
-    /// writes to the `_transactions/` directory.
+    /// When `commit_compaction` fails to apply the commit after
+    /// `rewrite_files` has already written new data files, those files must be
+    /// left in place: an at-least-once caller may be re-committing a rewrite
+    /// whose output a previous incarnation already published, so an inline
+    /// delete can destroy live data. Unpublished files are reclaimed by
+    /// vacuum. We force the commit failure by injecting an error on writes to
+    /// the `_transactions/` directory.
     #[tokio::test]
-    async fn test_commit_compaction_cleans_up_data_on_commit_failure() {
+    async fn test_commit_compaction_retains_data_on_commit_failure() {
         use crate::dataset::builder::DatasetBuilder;
         use crate::utils::test::FailingProxyStore;
         use lance_io::object_store::ObjectStoreParams;
@@ -7094,7 +7097,7 @@ mod tests {
         // ReserveFragments transaction) and then calls `apply_commit` for the
         // rewrite itself. Skip the first transaction write so the reserve
         // succeeds, and fail the second so `apply_commit` errors out — that's
-        // the branch we want to exercise cleanup for.
+        // the failure branch under test.
         failing.fail_after_n("put", "_transactions", 1, "injected commit failure");
         failing.fail_after_n(
             "put_multipart",
@@ -7125,15 +7128,18 @@ mod tests {
             "Compaction should fail when transaction commit fails"
         );
 
-        assert_eq!(
-            count_data_files_in(test_uri),
-            baseline_files,
-            "Compaction data files should be cleaned up when commit fails"
+        // The rewrite's output files are retained as orphans for vacuum, and
+        // the dataset is untouched: same tip, same rows.
+        assert!(
+            count_data_files_in(test_uri) > baseline_files,
+            "A failed commit must not delete the rewrite's output files"
         );
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 200);
     }
 
     #[tokio::test]
-    async fn test_commit_compaction_cleans_up_blob_v2_sidecars_on_commit_failure() {
+    async fn test_commit_compaction_retains_blob_v2_sidecars_on_commit_failure() {
         use crate::BlobArrayBuilder;
         use crate::dataset::builder::DatasetBuilder;
         use crate::utils::test::FailingProxyStore;
@@ -7206,10 +7212,11 @@ mod tests {
             "Compaction should fail when transaction commit fails"
         );
 
-        assert_eq!(
-            count_data_files_in(test_uri),
-            baseline_files,
-            "Blob v2 sidecars should be cleaned up when commit fails"
+        // Blob sidecars written by the failed rewrite are retained as orphans
+        // for vacuum; nothing the failed attempt wrote is deleted.
+        assert!(
+            count_data_files_in(test_uri) > baseline_files,
+            "A failed commit must not delete the rewrite's blob sidecars"
         );
     }
 
