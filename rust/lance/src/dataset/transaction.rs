@@ -2549,6 +2549,17 @@ impl Transaction {
         Ok(())
     }
 
+    fn duplicate_rewrite_error(version: u64, fragment_id: u64) -> Error {
+        Error::commit_conflict_source(
+            version,
+            format!(
+                "a rewrite operation attempts to replace fragment id={} more than once",
+                fragment_id
+            )
+            .into(),
+        )
+    }
+
     fn handle_rewrite_fragments(
         final_fragments: &mut Vec<Fragment>,
         groups: &[RewriteGroup],
@@ -2600,17 +2611,20 @@ impl Transaction {
             // from the original fragments. We don't modify it here.
 
             if contiguous {
-                for flag in removed
-                    .iter_mut()
-                    .skip(start)
-                    .take(group.old_fragments.len())
-                {
-                    *flag = true;
+                for (i, old_fragment) in group.old_fragments.iter().enumerate() {
+                    let position = start + i;
+                    if removed[position] {
+                        return Err(Self::duplicate_rewrite_error(version, old_fragment.id));
+                    }
+                    removed[position] = true;
                 }
                 replacements.insert(start, new_fragments);
             } else {
                 for old_fragment in group.old_fragments.iter() {
                     if let Some(&position) = positions.get(&old_fragment.id) {
+                        if removed[position] {
+                            return Err(Self::duplicate_rewrite_error(version, old_fragment.id));
+                        }
                         removed[position] = true;
                     }
                 }
@@ -3570,6 +3584,34 @@ mod tests {
         let error = result.unwrap_err();
         assert!(matches!(error, Error::CommitConflict { .. }));
         assert!(error.to_string().contains("id=7"));
+    }
+
+    #[test]
+    fn test_rewrite_fragments_duplicate_fragment() {
+        let mut final_fragments: Vec<Fragment> = (0..4).map(Fragment::new).collect();
+        let rewrite_groups = vec![
+            RewriteGroup {
+                old_fragments: vec![Fragment::new(1), Fragment::new(2)],
+                new_fragments: vec![Fragment::new(0)],
+            },
+            RewriteGroup {
+                old_fragments: vec![Fragment::new(2), Fragment::new(3)],
+                new_fragments: vec![Fragment::new(0)],
+            },
+        ];
+
+        let mut fragment_id = 10;
+        let result = Transaction::handle_rewrite_fragments(
+            &mut final_fragments,
+            &rewrite_groups,
+            &mut fragment_id,
+            42,
+            None,
+        );
+
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::CommitConflict { .. }));
+        assert!(error.to_string().contains("id=2"));
     }
 
     #[test]
