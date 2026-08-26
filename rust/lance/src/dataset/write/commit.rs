@@ -4,9 +4,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use lance_core::utils::mask::RowAddrTreeMap;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::{
     format::{DataStorageFormat, is_detached_version},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
@@ -388,6 +390,12 @@ impl<'a> CommitBuilder<'a> {
                         branch: manifest.branch.clone(),
                     },
                 );
+                let scan_scheduler = ScanScheduler::new(
+                    object_store.clone(),
+                    SchedulerConfig::max_bandwidth(&object_store),
+                );
+                let file_scheduler_cache = Arc::new(DashMap::new());
+                let v1_reader_cache = Arc::new(DashMap::new());
 
                 Ok(Dataset {
                     object_store,
@@ -403,6 +411,9 @@ impl<'a> CommitBuilder<'a> {
                     metadata_cache,
                     file_reader_options: None,
                     store_params: self.store_params.clone().map(Box::new),
+                    scan_scheduler,
+                    file_scheduler_cache,
+                    v1_reader_cache,
                 })
             }
         }
