@@ -40,6 +40,7 @@ runs:
         manylinux: ${{ inputs.manylinux }}
         args: ${{ inputs.args }}
         maturin-version: "1.10.2"
+        sccache: "true"
         before-script-linux: |
           set -e
           yum install -y openssl-devel \
@@ -59,6 +60,7 @@ runs:
           -e CXX=clang++
         args: ${{ inputs.args }}
         maturin-version: "1.10.2"
+        sccache: "true"
         before-script-linux: |
           set -e
           yum install -y openssl-devel clang \
@@ -75,6 +77,7 @@ runs:
         manylinux: ${{ inputs.manylinux }}
         args: ${{ inputs.args }}
         maturin-version: "1.10.2"
+        sccache: "true"
         before-script-linux: |
           set -e
           yum install -y openssl-devel clang \
