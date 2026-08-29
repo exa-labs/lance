@@ -1,4 +1,6 @@
 # We create a composite action to be re-used both for testing and for releasing
+# sccache uses the GitHub Actions cache backend; runs reuse caches written by
+# the same branch or by the default branch.
 name: build-linux-wheel
 description: "Build a manylinux wheel for lance"
 inputs:
