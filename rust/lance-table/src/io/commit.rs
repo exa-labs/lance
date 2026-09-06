@@ -1345,7 +1345,10 @@ where
         // flag and surface release errors; the guard only covers cancellation.
         let lease = LeaseGuard::new(self.lock(manifest.version).await?);
 
-        // Head the location and make sure it's not already committed
+        // Head the location and make sure it's not already committed. This is
+        // only a cheap early exit: the put below is conditional, so a writer
+        // that lands between this check and the put still surfaces as a
+        // conflict instead of being overwritten.
         match object_store.inner.head(&path).await {
             Ok(_) => {
                 // The path already exists, so it's already committed
@@ -1363,21 +1366,35 @@ where
                 return Err(CommitError::OtherError(e.into()));
             }
         }
-        let res = manifest_writer(object_store, manifest, indices, &path, transaction).await;
+
+        // The lock is the caller's promise of exclusion, not proof of it: a lock
+        // that is scoped too narrowly (or a no-op) lets two writers reach this
+        // point for the same version, and a plain put would let the slower one
+        // silently replace the faster one's manifest while both report success.
+        // Write with put-if-absent so the store, not the lock, decides who wins.
+        let res = put_manifest_if_absent(
+            object_store,
+            manifest,
+            indices,
+            &path,
+            manifest_writer,
+            transaction,
+        )
+        .await;
 
         // Release the lock
         lease.release(res.is_ok()).await?;
 
-        let res = res?;
+        let (size, e_tag) = res?;
 
         write_version_hint(object_store, base_path, manifest.version).await;
 
         Ok(ManifestLocation {
             version: manifest.version,
-            size: Some(res.size as u64),
+            size: Some(size),
             naming_scheme,
             path,
-            e_tag: res.e_tag,
+            e_tag,
         })
     }
 }
@@ -1473,6 +1490,46 @@ impl Debug for RenameCommitHandler {
     }
 }
 
+/// Serialize `manifest` in memory and store it at `path` only if nothing is
+/// there yet (`PutMode::Create`; `If-None-Match: *` on S3).
+///
+/// Returns the manifest's size in bytes and the store's e-tag. A losing race
+/// for the same version surfaces as [CommitError::CommitConflict], so the
+/// manifest already at `path` is never replaced. This is the single atomic
+/// step every object-store-backed commit handler funnels through.
+async fn put_manifest_if_absent(
+    object_store: &ObjectStore,
+    manifest: &mut Manifest,
+    indices: Option<Vec<IndexMetadata>>,
+    path: &Path,
+    manifest_writer: ManifestWriter,
+    transaction: Option<Transaction>,
+) -> std::result::Result<(u64, Option<String>), CommitError> {
+    let memory_store = ObjectStore::memory();
+    let staging_path = Path::from("dummy");
+    manifest_writer(&memory_store, manifest, indices, &staging_path, transaction).await?;
+    let manifest_bytes = memory_store.read_one_all(&staging_path).await?;
+    let size = manifest_bytes.len() as u64;
+    let res = object_store
+        .inner
+        .put_opts(
+            path,
+            manifest_bytes.into(),
+            PutOptions {
+                mode: object_store::PutMode::Create,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|err| match err {
+            ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. } => {
+                CommitError::CommitConflict
+            }
+            _ => CommitError::OtherError(err.into()),
+        })?;
+    Ok((size, res.e_tag))
+}
+
 pub struct ConditionalPutCommitHandler;
 
 #[async_trait::async_trait]
@@ -1489,35 +1546,15 @@ impl CommitHandler for ConditionalPutCommitHandler {
     ) -> std::result::Result<ManifestLocation, CommitError> {
         let path = naming_scheme.manifest_path(base_path, manifest.version);
 
-        let memory_store = ObjectStore::memory();
-        let dummy_path = "dummy";
-        manifest_writer(
-            &memory_store,
+        let (size, e_tag) = put_manifest_if_absent(
+            object_store,
             manifest,
             indices,
-            &dummy_path.into(),
+            &path,
+            manifest_writer,
             transaction,
         )
         .await?;
-        let dummy_data = memory_store.read_one_all(&dummy_path.into()).await?;
-        let size = dummy_data.len() as u64;
-        let res = object_store
-            .inner
-            .put_opts(
-                &path,
-                dummy_data.into(),
-                PutOptions {
-                    mode: object_store::PutMode::Create,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|err| match err {
-                ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. } => {
-                    CommitError::CommitConflict
-                }
-                _ => CommitError::OtherError(err.into()),
-            })?;
 
         write_version_hint(object_store, base_path, manifest.version).await;
 
@@ -1526,7 +1563,7 @@ impl CommitHandler for ConditionalPutCommitHandler {
             path,
             size: Some(size),
             naming_scheme,
-            e_tag: res.e_tag,
+            e_tag,
         })
     }
 }
