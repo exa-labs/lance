@@ -1286,6 +1286,35 @@ mod tests {
         test_commit_handler(handler, true).await;
     }
 
+    /// A `CommitLock` that excludes nobody, as when a caller passes a lock only
+    /// as a pre-commit callback. The handler's put-if-absent manifest write must
+    /// still keep two writers from committing the same version.
+    #[tokio::test]
+    async fn test_noop_commit_lock_handler() {
+        #[derive(Debug)]
+        struct NoopCommitLock;
+
+        struct NoopCommitLease;
+
+        #[async_trait::async_trait]
+        impl CommitLock for NoopCommitLock {
+            type Lease = NoopCommitLease;
+
+            async fn lock(&self, _version: u64) -> std::result::Result<Self::Lease, CommitError> {
+                Ok(NoopCommitLease)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl CommitLease for NoopCommitLease {
+            async fn release(&self, _success: bool) -> std::result::Result<(), CommitError> {
+                Ok(())
+            }
+        }
+
+        test_commit_handler(Arc::new(NoopCommitLock), true).await;
+    }
+
     #[tokio::test]
     async fn test_unsafe_commit_handler() {
         let handler = Arc::new(UnsafeCommitHandler);

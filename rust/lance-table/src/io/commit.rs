@@ -1243,6 +1243,11 @@ impl Debug for UnsafeCommitHandler {
 }
 
 /// A commit implementation that uses a lock to prevent conflicting writes.
+///
+/// The manifest is still written put-if-absent while the lock is held, so a
+/// lock that fails to exclude a concurrent writer of the same version makes the
+/// slower writer fail with [CommitError::CommitConflict] instead of overwriting
+/// the manifest that already landed.
 #[async_trait::async_trait]
 pub trait CommitLock: Debug {
     type Lease: CommitLease;
@@ -1592,11 +1597,23 @@ impl Default for CommitConfig {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::collections::HashMap;
+    use std::fmt::{Display, Formatter};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_core::datatypes::Schema;
     use lance_core::utils::tempfile::TempObjDir;
+    use lance_file::version::LanceFileVersion;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        PutMultipartOptions, PutPayload, PutResult, Result as OSResult,
+    };
 
     use super::*;
+    use crate::format::DataStorageFormat;
 
     #[test]
     fn test_manifest_naming_scheme() {
@@ -2026,15 +2043,23 @@ mod tests {
         );
     }
 
-    /// A [CommitLock] whose lease records whether it was released, so we can
-    /// assert the lock does not leak when the commit future is cancelled.
-    #[derive(Debug)]
+    /// A [CommitLock] that always locks and excludes nobody, recording the
+    /// `success` flag of every lease release in order. Lets tests assert both
+    /// that the lock does not leak when the commit future is cancelled and
+    /// which writer the handler reported as the winner.
+    #[derive(Debug, Default)]
     struct TrackingLock {
-        released: Arc<AtomicBool>,
+        releases: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl TrackingLock {
+        fn releases(&self) -> Vec<bool> {
+            self.releases.lock().unwrap().clone()
+        }
     }
 
     struct TrackingLease {
-        released: Arc<AtomicBool>,
+        releases: Arc<Mutex<Vec<bool>>>,
     }
 
     #[async_trait::async_trait]
@@ -2042,18 +2067,92 @@ mod tests {
         type Lease = TrackingLease;
         async fn lock(&self, _version: u64) -> std::result::Result<Self::Lease, CommitError> {
             Ok(TrackingLease {
-                released: self.released.clone(),
+                releases: self.releases.clone(),
             })
         }
     }
 
     #[async_trait::async_trait]
     impl CommitLease for TrackingLease {
-        async fn release(&self, _success: bool) -> std::result::Result<(), CommitError> {
-            self.released
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+        async fn release(&self, success: bool) -> std::result::Result<(), CommitError> {
+            self.releases.lock().unwrap().push(success);
             Ok(())
         }
+    }
+
+    /// Forwards to an inner store but reports `absent_path` as missing on HEAD,
+    /// so every writer passes the lock handler's pre-check the way two writers
+    /// racing through a non-exclusive lock do in production.
+    #[derive(Debug)]
+    struct AbsentHeadStore {
+        inner: Arc<dyn OSObjectStore>,
+        absent_path: Path,
+    }
+
+    impl Display for AbsentHeadStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "AbsentHeadStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OSObjectStore for AbsentHeadStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            if options.head && location == &self.absent_path {
+                return Err(ObjectStoreError::NotFound {
+                    path: location.to_string(),
+                    source: "AbsentHeadStore hides this path from HEAD".into(),
+                });
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    /// A fresh version-1 manifest with a single Int32 column named `column`.
+    fn test_manifest(column: &str) -> Manifest {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(column, DataType::Int32, false)]);
+        Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(vec![]),
+            DataStorageFormat::new(LanceFileVersion::Stable),
+            HashMap::new(),
+        )
     }
 
     /// A [CommitLock] whose lease hangs on its first `release` call but completes
@@ -2132,30 +2231,11 @@ mod tests {
     /// still release the lock; otherwise it leaks until the lease's TTL expires.
     #[tokio::test]
     async fn test_commit_lock_released_on_cancellation() {
-        use std::collections::HashMap;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-        use lance_core::datatypes::Schema;
-        use lance_file::version::LanceFileVersion;
-
-        use crate::format::DataStorageFormat;
-
-        let released = Arc::new(AtomicBool::new(false));
-        let lock = TrackingLock {
-            released: released.clone(),
-        };
+        let lock = TrackingLock::default();
 
         let object_store = ObjectStore::memory();
         let base_path = Path::from("test");
-        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]);
-        let mut manifest = Manifest::new(
-            Schema::try_from(&arrow_schema).unwrap(),
-            Arc::new(vec![]),
-            DataStorageFormat::new(LanceFileVersion::Stable),
-            HashMap::new(),
-        );
+        let mut manifest = test_manifest("i");
 
         // The commit will hang on the manifest writer while holding the lock.
         // Cancel it the same way a commit timeout would: drop the future.
@@ -2173,13 +2253,14 @@ mod tests {
 
         // The drop guard releases the lock on a background task; wait for it.
         for _ in 0..100 {
-            if released.load(Ordering::SeqCst) {
+            if !lock.releases().is_empty() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(
-            released.load(Ordering::SeqCst),
+        assert_eq!(
+            lock.releases(),
+            vec![false],
             "lock must be released after the commit future is cancelled"
         );
     }
@@ -2189,16 +2270,6 @@ mod tests {
     /// lock via the drop-path best-effort release.
     #[tokio::test]
     async fn test_commit_lock_released_on_cancellation_during_release() {
-        use std::collections::HashMap;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-        use lance_core::datatypes::Schema;
-        use lance_file::version::LanceFileVersion;
-
-        use crate::format::DataStorageFormat;
-
         let release_calls = Arc::new(AtomicUsize::new(0));
         let released = Arc::new(AtomicBool::new(false));
         let lock = HangingReleaseLock {
@@ -2208,13 +2279,7 @@ mod tests {
 
         let object_store = ObjectStore::memory();
         let base_path = Path::from("test");
-        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]);
-        let mut manifest = Manifest::new(
-            Schema::try_from(&arrow_schema).unwrap(),
-            Arc::new(vec![]),
-            DataStorageFormat::new(LanceFileVersion::Stable),
-            HashMap::new(),
-        );
+        let mut manifest = test_manifest("i");
 
         // The manifest writer succeeds, so the commit reaches the explicit
         // release, which hangs. Cancel it the same way a commit timeout would.
@@ -2247,5 +2312,105 @@ mod tests {
             2,
             "expected the hung explicit release plus one best-effort drop release"
         );
+    }
+
+    /// A lock that excludes nobody must not let a second writer of the same
+    /// version replace the manifest that already landed: the put-if-absent
+    /// write, not the lock, decides who wins.
+    #[tokio::test]
+    async fn test_commit_lock_handler_does_not_overwrite_existing_manifest() {
+        let lock = TrackingLock::default();
+        let base_path = Path::from("test");
+        let mut winner = test_manifest("i");
+        let mut loser = test_manifest("j");
+        assert_eq!(winner.version, loser.version);
+        let path = ManifestNamingScheme::V2.manifest_path(&base_path, winner.version);
+
+        // Both writers see the version as absent, as they did in production when
+        // the second HEAD ran before the first put became visible.
+        let mut object_store = ObjectStore::memory();
+        object_store.inner = Arc::new(AbsentHeadStore {
+            inner: object_store.inner.clone(),
+            absent_path: path.clone(),
+        });
+
+        let winner_location = lock
+            .commit(
+                &mut winner,
+                None,
+                &base_path,
+                &object_store,
+                write_manifest_file_to_path,
+                ManifestNamingScheme::V2,
+                None,
+            )
+            .await
+            .unwrap();
+        let winner_bytes = object_store.read_one_all(&path).await.unwrap();
+        assert_eq!(winner_location.size, Some(winner_bytes.len() as u64));
+
+        let loser_result = lock
+            .commit(
+                &mut loser,
+                None,
+                &base_path,
+                &object_store,
+                write_manifest_file_to_path,
+                ManifestNamingScheme::V2,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(loser_result, Err(CommitError::CommitConflict)),
+            "second writer of the same version must see a conflict, got {loser_result:?}"
+        );
+
+        // The loser's manifest differs from the winner's, so an overwrite would
+        // change the stored bytes.
+        let scratch = ObjectStore::memory();
+        write_manifest_file_to_path(&scratch, &mut loser, None, &path, None)
+            .await
+            .unwrap();
+        let loser_bytes = scratch.read_one_all(&path).await.unwrap();
+        assert_ne!(loser_bytes, winner_bytes);
+        assert_eq!(
+            object_store.read_one_all(&path).await.unwrap(),
+            winner_bytes,
+            "the manifest that landed first must be left untouched"
+        );
+        assert_eq!(lock.releases(), vec![true, false]);
+    }
+
+    /// The put-if-absent write must not get in the way of an uncontended commit
+    /// through a lock: it lands, reports the manifest's size, and releases the
+    /// lease as a success.
+    #[tokio::test]
+    async fn test_commit_lock_handler_uncontended_commit_succeeds() {
+        let lock = TrackingLock::default();
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("test");
+        let mut manifest = test_manifest("i");
+
+        let location = lock
+            .commit(
+                &mut manifest,
+                None,
+                &base_path,
+                &object_store,
+                write_manifest_file_to_path,
+                ManifestNamingScheme::V2,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let path = ManifestNamingScheme::V2.manifest_path(&base_path, manifest.version);
+        assert_eq!(location.path, path);
+        assert_eq!(
+            location.size,
+            Some(object_store.size(&path).await.unwrap()),
+            "reported size must match the stored manifest"
+        );
+        assert_eq!(lock.releases(), vec![true]);
     }
 }
