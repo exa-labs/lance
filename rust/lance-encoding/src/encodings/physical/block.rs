@@ -130,6 +130,11 @@ impl FromStr for CompressionScheme {
 pub trait BufferCompressor: std::fmt::Debug + Send + Sync {
     fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
     fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
+    /// Decoded byte length when the encoding carries it, or None for streaming formats.
+    /// This reads metadata only; successful decompression must still validate the payload.
+    fn decompressed_size(&self, _input_buf: &[u8]) -> Result<Option<usize>> {
+        Ok(None)
+    }
     fn config(&self) -> CompressionConfig;
 }
 
@@ -234,18 +239,51 @@ mod zstd {
             let mut len_buf = [0u8; LENGTH_PREFIX_SIZE];
             len_buf.copy_from_slice(&input_buf[..LENGTH_PREFIX_SIZE]);
 
-            let uncompressed_len = u64::from_le_bytes(len_buf) as usize;
+            let uncompressed_len = usize::try_from(u64::from_le_bytes(len_buf))
+                .map_err(|e| Error::invalid_input(format!("Invalid Zstd decoded length: {e}")))?;
 
             let start = output_buf.len();
-            output_buf.resize(start + uncompressed_len, 0);
+            let end = start
+                .checked_add(uncompressed_len)
+                .ok_or_else(|| Error::invalid_input("Zstd decoded size overflow".to_string()))?;
+            output_buf
+                .try_reserve(uncompressed_len)
+                .map_err(|e| Error::invalid_input(format!("Cannot reserve Zstd output: {e}")))?;
+            output_buf.resize(end, 0);
 
             let compressed_data = &input_buf[LENGTH_PREFIX_SIZE..];
-            decompress_to_buffer(compressed_data, &mut output_buf[start..])?;
-            Ok(())
+            match decompress_to_buffer(compressed_data, &mut output_buf[start..]) {
+                Ok(written) if written == uncompressed_len => Ok(()),
+                Ok(written) => {
+                    output_buf.truncate(start);
+                    Err(Error::invalid_input(format!(
+                        "Zstd decoded {written} bytes, expected {uncompressed_len}"
+                    )))
+                }
+                Err(error) => {
+                    output_buf.truncate(start);
+                    Err(error.into())
+                }
+            }
         }
     }
 
     impl BufferCompressor for ZstdBufferCompressor {
+        fn decompressed_size(&self, input_buf: &[u8]) -> Result<Option<usize>> {
+            if input_buf.is_empty() {
+                return Ok(Some(0));
+            }
+            // Legacy raw frames may omit their decoded length. Keep streaming those.
+            if self.is_raw_stream_format(input_buf) {
+                return Ok(None);
+            }
+            let mut length = [0; 8];
+            length.copy_from_slice(&input_buf[..8]);
+            usize::try_from(u64::from_le_bytes(length))
+                .map(Some)
+                .map_err(|e| Error::invalid_input(format!("Invalid Zstd decoded length: {e}")))
+        }
+
         fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
             output_buf.write_all(&(input_buf.len() as u64).to_le_bytes())?;
 
@@ -512,6 +550,32 @@ impl CompressedBufferEncoder {
         offsets: &[T],
         decompressed: &mut Vec<u8>,
     ) -> Result<LanceBuffer> {
+        // Preflight lengths before decoding, so high compression ratios do not repeatedly
+        // grow and copy the already-decoded output. Other formats retain the old estimate.
+        let mut total = Some(0usize);
+        for off in offsets.windows(2) {
+            let value = data
+                .get(off[0].as_usize()..off[1].as_usize())
+                .ok_or_else(|| {
+                    Error::invalid_input("Compressed value offsets are out of bounds".to_string())
+                })?;
+            total = match (total, self.compressor.decompressed_size(value)?) {
+                (Some(total), Some(size)) => Some(total.checked_add(size).ok_or_else(|| {
+                    Error::invalid_input("Decoded block size overflow".to_string())
+                })?),
+                _ => None,
+            };
+        }
+        let capacity = match total {
+            Some(total) => total,
+            None => data.len().checked_mul(2).ok_or_else(|| {
+                Error::invalid_input("Decoded capacity estimate overflow".to_string())
+            })?,
+        };
+        decompressed
+            .try_reserve_exact(capacity)
+            .map_err(|e| Error::invalid_input(format!("Cannot reserve decoded block: {e}")))?;
+
         let mut new_offsets: Vec<T> = Vec::with_capacity(offsets.len());
         new_offsets.push(T::from_usize(0).unwrap());
 
@@ -577,7 +641,7 @@ impl PerValueCompressor for CompressedBufferEncoder {
 impl VariablePerValueDecompressor for CompressedBufferEncoder {
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
         let data_bytes = &data.data;
-        let mut decompressed = Vec::with_capacity(data_bytes.len() * 2);
+        let mut decompressed = Vec::new();
 
         let new_offsets = match data.bits_per_offset {
             32 => self.per_value_decompress(
@@ -664,6 +728,119 @@ mod tests {
         use std::io::Write;
 
         use super::*;
+
+        #[rstest::rstest]
+        #[case::small(32)]
+        #[case::high_ratio(128 * 1024)]
+        fn test_presized_values(#[case] size: usize) {
+            let encoder = CompressedBufferEncoder::default();
+            let values = vec![42; size * 3];
+            let mut compressed = Vec::new();
+            let offsets = encoder
+                .per_value_compress(
+                    &values,
+                    &[0_u64, size as u64, size as u64, values.len() as u64],
+                    &mut compressed,
+                )
+                .unwrap();
+            let mut output = Vec::new();
+            let decoded_offsets = encoder
+                .per_value_decompress(
+                    &compressed,
+                    &offsets.borrow_to_typed_slice::<u64>(),
+                    &mut output,
+                )
+                .unwrap();
+            assert_eq!(output, values);
+            assert_eq!(
+                &*decoded_offsets.borrow_to_typed_slice::<u64>(),
+                &[0, size as u64, size as u64, values.len() as u64]
+            );
+            assert!(output.capacity() < values.len() * 2);
+
+            let offsets32: Vec<u32> = offsets
+                .borrow_to_typed_slice::<u64>()
+                .iter()
+                .map(|&offset| offset as u32)
+                .collect();
+            let mut output32 = Vec::new();
+            encoder
+                .per_value_decompress(&compressed, &offsets32, &mut output32)
+                .unwrap();
+            assert_eq!(output32, values);
+        }
+
+        #[test]
+        fn test_mixed_raw_and_length_prefixed_values() {
+            let encoder = CompressedBufferEncoder::default();
+            let mut compressed = ::zstd::stream::encode_all(&b"legacy"[..], 0).unwrap();
+            let boundary = compressed.len() as u32;
+            encoder
+                .compressor
+                .compress(b"current", &mut compressed)
+                .unwrap();
+            let mut output = Vec::new();
+            let offsets = encoder
+                .per_value_decompress(
+                    &compressed,
+                    &[0_u32, boundary, boundary, compressed.len() as u32],
+                    &mut output,
+                )
+                .unwrap();
+            assert_eq!(output, b"legacycurrent");
+            assert_eq!(&*offsets.borrow_to_typed_slice::<u32>(), &[0, 6, 6, 13]);
+        }
+
+        #[rstest::rstest]
+        #[case::too_small(2)]
+        #[case::too_large(200)]
+        fn test_incorrect_length_preserves_existing_output(#[case] length: u64) {
+            let compressor = ZstdBufferCompressor::new(0);
+            let mut compressed = Vec::new();
+            compressor.compress(b"payload", &mut compressed).unwrap();
+            compressed[..8].copy_from_slice(&length.to_le_bytes());
+            let mut output = b"prefix".to_vec();
+            // Spare capacity must not allow a malformed payload to overwrite other values.
+            output.reserve(1024);
+            assert!(compressor.decompress(&compressed, &mut output).is_err());
+            assert_eq!(output, b"prefix");
+        }
+
+        #[test]
+        fn test_invalid_offsets_and_size_overflow() {
+            let encoder = CompressedBufferEncoder::default();
+            let mut output = Vec::new();
+            let error = encoder
+                .per_value_decompress(&[0], &[0_u32, 2], &mut output)
+                .unwrap_err();
+            assert!(error.to_string().contains("offsets are out of bounds"));
+            let data = [u64::MAX.to_le_bytes(), 1_u64.to_le_bytes()].concat();
+            assert!(
+                encoder
+                    .per_value_decompress(&data, &[0_u32, 8, 16], &mut output)
+                    .is_err()
+            );
+            assert!(output.is_empty());
+        }
+
+        #[test]
+        fn test_truncated_frame_and_empty_values() {
+            let compressor = ZstdBufferCompressor::new(0);
+            let mut data = Vec::new();
+            compressor.compress(b"payload", &mut data).unwrap();
+            let mut output = b"prefix".to_vec();
+            assert!(
+                compressor
+                    .decompress(&data[..data.len() - 1], &mut output)
+                    .is_err()
+            );
+            assert_eq!(output, b"prefix");
+            compressor.decompress(&[], &mut output).unwrap();
+            let mut empty = Vec::new();
+            compressor.compress(&[], &mut empty).unwrap();
+            compressor.decompress(&empty, &mut output).unwrap();
+            assert_eq!(output, b"prefix");
+        }
 
         #[test]
         fn test_compress_zstd_with_length_prefixed() {
