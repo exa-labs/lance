@@ -145,7 +145,7 @@ mod zstd {
 
     use super::*;
 
-    use ::zstd::bulk::{Compressor, decompress_to_buffer};
+    use ::zstd::bulk::{Compressor, Decompressor};
     use ::zstd::stream::copy_decode;
 
     /// A zstd buffer compressor that lazily creates and reuses compression contexts.
@@ -243,16 +243,20 @@ mod zstd {
                 .map_err(|e| Error::invalid_input(format!("Invalid Zstd decoded length: {e}")))?;
 
             let start = output_buf.len();
-            let end = start
+            start
                 .checked_add(uncompressed_len)
                 .ok_or_else(|| Error::invalid_input("Zstd decoded size overflow".to_string()))?;
             output_buf
                 .try_reserve(uncompressed_len)
                 .map_err(|e| Error::invalid_input(format!("Cannot reserve Zstd output: {e}")))?;
-            output_buf.resize(end, 0);
-
             let compressed_data = &input_buf[LENGTH_PREFIX_SIZE..];
-            match decompress_to_buffer(compressed_data, &mut output_buf[start..]) {
+            // Zstd's WriteBuf implementation initializes spare Vec capacity and updates
+            // its length only on success. Position at the end to preserve earlier values.
+            let mut destination = Cursor::new(&mut *output_buf);
+            destination.set_position(start as u64);
+            let result =
+                Decompressor::new()?.decompress_to_buffer(compressed_data, &mut destination);
+            match result {
                 Ok(written) if written == uncompressed_len => Ok(()),
                 Ok(written) => {
                     output_buf.truncate(start);
