@@ -2675,13 +2675,10 @@ impl Dataset {
     }
 
     pub fn get_fragment(&self, fragment_id: usize) -> Option<FileFragment> {
-        let dataset = Arc::new(self.clone());
-        let fragment = self
-            .manifest
-            .fragments
-            .iter()
-            .find(|f| f.id == fragment_id as u64)?;
-        Some(FileFragment::new(dataset, fragment.clone()))
+        let fragment_id = u32::try_from(fragment_id).ok()?;
+        self.get_frags_from_ordered_ids(&[fragment_id])
+            .pop()
+            .flatten()
     }
 
     pub fn fragments(&self) -> &Arc<Vec<Fragment>> {
