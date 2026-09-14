@@ -25,12 +25,15 @@
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::{fmt::Debug, fs::DirEntry};
 
 use super::manifest::write_manifest;
+use bytes::Bytes;
 use futures::Stream;
 use futures::future::Either;
+use futures::future::try_join_all;
 use futures::{
     StreamExt, TryStreamExt,
     future::{self, BoxFuture},
@@ -41,7 +44,10 @@ use lance_io::object_writer::{ObjectWriter, WriteResult, get_etag};
 use log::warn;
 use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::PutOptions;
-use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
+use object_store::{
+    Error as ObjectStoreError, MultipartUpload, ObjectStore as OSObjectStore, PutMode,
+    PutMultipartOptions, PutResult, path::Path,
+};
 use tracing::info;
 use url::Url;
 
@@ -1473,6 +1479,136 @@ impl Debug for RenameCommitHandler {
     }
 }
 
+/// Manifests at or below this size are written with a single conditional PUT,
+/// exactly as before. Manifests larger than this use a conditional multipart
+/// upload instead -- but only when the backing object store actually supports
+/// atomic (conditional) completion of a multipart upload. Stores that don't
+/// (e.g. GCS, whose XML multipart API has no conditional complete) report
+/// `Error::NotImplemented` from `put_multipart_opts`, and we transparently
+/// fall back to the single-PUT path rather than completing non-atomically.
+///
+/// Default: 8 MiB. Manifests are normally KBs in size; they only approach
+/// this threshold with very wide schemas or very large per-fragment
+/// statistics. The default is kept comfortably above that common case, while
+/// staying above `MIN_MULTIPART_PART_SIZE` so a manifest that does cross the
+/// threshold still uploads in a small, bounded number of parts. Override with
+/// the `LANCE_MANIFEST_MULTIPART_THRESHOLD` env var (bytes).
+const DEFAULT_MANIFEST_MULTIPART_THRESHOLD: usize = 8 * 1024 * 1024;
+
+/// Minimum size for a non-final multipart part. This mirrors the minimum
+/// enforced by S3 (and inherited by other backends): parts other than the
+/// last are rejected if they are smaller than this.
+const MIN_MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
+
+fn manifest_multipart_threshold() -> usize {
+    static THRESHOLD: OnceLock<usize> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("LANCE_MANIFEST_MULTIPART_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            // A part size below the store-enforced minimum would just fail,
+            // so clamp rather than let users configure a broken threshold.
+            .map(|raw| raw.max(MIN_MULTIPART_PART_SIZE))
+            .unwrap_or(DEFAULT_MANIFEST_MULTIPART_THRESHOLD)
+    })
+}
+
+/// Outcome of attempting a conditional multipart upload for the manifest.
+enum MultipartCommitOutcome {
+    /// The multipart upload completed (conditionally) successfully.
+    Completed(PutResult),
+    /// The backend does not support conditional completion of a multipart
+    /// upload. No data was written (or it was already cleaned up); the
+    /// caller should fall back to a single conditional PUT.
+    Unsupported,
+}
+
+/// Write `data` to `path` via a conditional (`PutMode::Create`) multipart
+/// upload, if the backend supports it.
+///
+/// This never falls back internally: `Unsupported` is returned so the caller
+/// can retry with a single PUT using the same conflict-mapping semantics as
+/// [`single_conditional_put`].
+async fn try_conditional_multipart_put(
+    object_store: &ObjectStore,
+    path: &Path,
+    data: &Bytes,
+) -> std::result::Result<MultipartCommitOutcome, CommitError> {
+    let mut upload = match object_store
+        .inner
+        .put_multipart_opts(
+            path,
+            PutMultipartOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(upload) => upload,
+        // Nothing has been written yet, so it's safe to fall back to a
+        // single PUT.
+        Err(ObjectStoreError::NotImplemented { .. }) => {
+            return Ok(MultipartCommitOutcome::Unsupported);
+        }
+        Err(err) => return Err(CommitError::OtherError(err.into())),
+    };
+
+    let part_size = manifest_multipart_threshold().max(MIN_MULTIPART_PART_SIZE);
+    let mut part_futures = Vec::with_capacity(data.len().div_ceil(part_size));
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let end = (offset + part_size).min(data.len());
+        part_futures.push(upload.put_part(data.slice(offset..end).into()));
+        offset = end;
+    }
+
+    if let Err(err) = try_join_all(part_futures).await {
+        // A part failed, so we never reach `complete`. The object_store
+        // crate only guarantees best-effort abort-on-failure from within
+        // `complete` itself, so clean up here.
+        let _ = upload.abort().await;
+        return Err(CommitError::OtherError(err.into()));
+    }
+
+    match upload.complete().await {
+        Ok(res) => Ok(MultipartCommitOutcome::Completed(res)),
+        // A lost `PutMode::Create` race, mapped the same way `put_opts`
+        // already maps it (see `single_conditional_put`). On this path
+        // object_store has already made a best-effort attempt to abort the
+        // multipart upload for us.
+        Err(ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. }) => {
+            Err(CommitError::CommitConflict)
+        }
+        Err(err) => Err(CommitError::OtherError(err.into())),
+    }
+}
+
+/// Write `data` to `path` with a single conditional (`PutMode::Create`) PUT.
+async fn single_conditional_put(
+    object_store: &ObjectStore,
+    path: &Path,
+    data: Bytes,
+) -> std::result::Result<PutResult, CommitError> {
+    object_store
+        .inner
+        .put_opts(
+            path,
+            data.into(),
+            PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|err| match err {
+            ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. } => {
+                CommitError::CommitConflict
+            }
+            _ => CommitError::OtherError(err.into()),
+        })
+}
+
 pub struct ConditionalPutCommitHandler;
 
 #[async_trait::async_trait]
@@ -1501,23 +1637,20 @@ impl CommitHandler for ConditionalPutCommitHandler {
         .await?;
         let dummy_data = memory_store.read_one_all(&dummy_path.into()).await?;
         let size = dummy_data.len() as u64;
-        let res = object_store
-            .inner
-            .put_opts(
-                &path,
-                dummy_data.into(),
-                PutOptions {
-                    mode: object_store::PutMode::Create,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|err| match err {
-                ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. } => {
-                    CommitError::CommitConflict
+
+        let res = if dummy_data.len() > manifest_multipart_threshold() {
+            match try_conditional_multipart_put(object_store, &path, &dummy_data).await? {
+                MultipartCommitOutcome::Completed(res) => res,
+                // The store can't do a conditional multipart complete (e.g.
+                // GCS). Fall back to the single-PUT path so we never
+                // silently lose atomicity.
+                MultipartCommitOutcome::Unsupported => {
+                    single_conditional_put(object_store, &path, dummy_data).await?
                 }
-                _ => CommitError::OtherError(err.into()),
-            })?;
+            }
+        } else {
+            single_conditional_put(object_store, &path, dummy_data).await?
+        };
 
         write_version_hint(object_store, base_path, manifest.version).await;
 
@@ -2210,5 +2343,155 @@ mod tests {
             2,
             "expected the hung explicit release plus one best-effort drop release"
         );
+    }
+
+    /// A manifest writer that ignores the manifest content and instead writes
+    /// a fixed-size payload, so tests can deterministically cross (or stay
+    /// under) `manifest_multipart_threshold()`.
+    fn fixed_size_manifest_writer<'a>(
+        object_store: &'a ObjectStore,
+        _manifest: &'a mut Manifest,
+        _indices: Option<Vec<IndexMetadata>>,
+        path: &'a Path,
+        _transaction: Option<Transaction>,
+    ) -> BoxFuture<'a, Result<WriteResult>> {
+        use tokio::io::AsyncWriteExt;
+
+        Box::pin(async move {
+            let mut writer = ObjectWriter::new(object_store, path).await?;
+            let payload = vec![7u8; OVERSIZED_MANIFEST_PAYLOAD_LEN];
+            writer
+                .write_all(&payload)
+                .await
+                .map_err(|e| Error::io_source(Box::new(e)))?;
+            Writer::shutdown(&mut writer).await
+        })
+    }
+
+    /// Comfortably above `DEFAULT_MANIFEST_MULTIPART_THRESHOLD` (8 MiB), so
+    /// the commit handler takes the multipart path, and spans multiple parts
+    /// at the default part size.
+    const OVERSIZED_MANIFEST_PAYLOAD_LEN: usize = 9 * 1024 * 1024;
+
+    fn test_manifest() -> Manifest {
+        use std::collections::HashMap;
+
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
+        use lance_file::version::LanceFileVersion;
+
+        use crate::format::DataStorageFormat;
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]);
+        Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(vec![]),
+            DataStorageFormat::new(LanceFileVersion::Stable),
+            HashMap::new(),
+        )
+    }
+
+    /// A manifest large enough to exceed the multipart threshold is written
+    /// via a conditional multipart upload, and the resulting object is
+    /// readable and complete.
+    #[tokio::test]
+    async fn test_conditional_put_commit_uses_multipart_for_large_manifest() {
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("test");
+        let mut manifest = test_manifest();
+
+        let location = ConditionalPutCommitHandler
+            .commit(
+                &mut manifest,
+                None,
+                &base_path,
+                &object_store,
+                fixed_size_manifest_writer,
+                ManifestNamingScheme::V2,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(location.size, Some(OVERSIZED_MANIFEST_PAYLOAD_LEN as u64));
+
+        let bytes = object_store.read_one_all(&location.path).await.unwrap();
+        assert_eq!(bytes.len(), OVERSIZED_MANIFEST_PAYLOAD_LEN);
+        assert!(bytes.iter().all(|&b| b == 7));
+    }
+
+    /// A lost `PutMode::Create` race on the multipart path must surface as
+    /// [`CommitError::CommitConflict`], exactly as it does on the small
+    /// single-PUT path, so Lance's commit-retry loop still works.
+    #[tokio::test]
+    async fn test_conditional_put_commit_multipart_conflict() {
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("test");
+        let mut manifest = test_manifest();
+
+        ConditionalPutCommitHandler
+            .commit(
+                &mut manifest,
+                None,
+                &base_path,
+                &object_store,
+                fixed_size_manifest_writer,
+                ManifestNamingScheme::V2,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Commit the same version again; the path already exists.
+        let mut manifest_again = test_manifest();
+        let result = ConditionalPutCommitHandler
+            .commit(
+                &mut manifest_again,
+                None,
+                &base_path,
+                &object_store,
+                fixed_size_manifest_writer,
+                ManifestNamingScheme::V2,
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(CommitError::CommitConflict)),
+            "expected a commit conflict, got {result:?}"
+        );
+    }
+
+    /// Manifests at or below the threshold keep using the original
+    /// single-PUT path (a sanity check that the branch condition is
+    /// `>` and not `>=`, and that small manifests are unaffected).
+    #[tokio::test]
+    async fn test_conditional_put_commit_small_manifest_uses_single_put() {
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("test");
+        let mut manifest = test_manifest();
+
+        // The default manifest writer produces a tiny payload.
+        let location = ConditionalPutCommitHandler
+            .commit(
+                &mut manifest,
+                None,
+                &base_path,
+                &object_store,
+                write_manifest_file_to_path,
+                ManifestNamingScheme::V2,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let size = location.size.unwrap();
+        assert!(
+            size < manifest_multipart_threshold() as u64,
+            "expected a small manifest, got {size} bytes"
+        );
+
+        let bytes = object_store.read_one_all(&location.path).await.unwrap();
+        assert_eq!(bytes.len(), size as usize);
     }
 }
