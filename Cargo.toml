@@ -265,3 +265,6 @@ multiple-crate-versions = "allow"
 single_range_in_vec_init = "allow"
 large_futures = "deny"
 disallowed_macros = "deny"
+
+[patch.crates-io]
+object_store = { git = "https://github.com/exa-labs/arrow-rs-object-store", tag = "v0.13.2+exa.1" }
