@@ -1504,41 +1504,63 @@ const DEFAULT_MANIFEST_MULTIPART_THRESHOLD: usize = 8 * 1024 * 1024;
 /// last are rejected if they are smaller than this.
 const MIN_MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
 
-/// Target number of parts for a manifest multipart upload. Part size is
-/// derived from the manifest's total size so that it lands at roughly this
-/// many parts (see [`manifest_multipart_part_size`]), which keeps part count
-/// far below S3's 10,000-part-per-upload limit by construction: even a 1 TB
-/// manifest would need only ~100 parts at the resulting ~10 GiB part size
-/// (clamped to the 5 GiB per-part max enforced elsewhere).
-const MANIFEST_MULTIPART_TARGET_PART_COUNT: usize = 100;
-
-/// Floor for a manifest multipart part size. This is independent of --
-/// and much larger than -- [`MIN_MULTIPART_PART_SIZE`] (S3's hard minimum):
-/// it exists so that manifests just over the multipart threshold don't get
-/// split into a large number of tiny parts. E.g. a manifest just over the
-/// (8 MiB default) threshold would otherwise produce a part size near zero
-/// from `total_len / 100`; the floor keeps it to a single part instead.
+/// Floor for a manifest multipart part size. Independent of -- and much
+/// larger than -- [`MIN_MULTIPART_PART_SIZE`] (S3's hard minimum): it exists
+/// so that manifests just over the multipart threshold don't get split into
+/// a large number of tiny parts. E.g. a manifest just over the (8 MiB
+/// default) threshold divided across `max_upload_parallelism()` (10 by
+/// default) parts would otherwise produce ~1 part every ~800 KiB; the floor
+/// keeps a manifest that size to a single part instead.
 const MANIFEST_MULTIPART_MIN_PART_SIZE: usize = 32 * 1024 * 1024;
+
+/// Cap on a manifest multipart part size, so that a single part doesn't
+/// become pathologically large for bigger manifests (well under S3's 5 GiB
+/// per-part hard limit, and big enough that per-request overhead is
+/// negligible relative to transfer time at this size). This happens to match
+/// `LANCE_INITIAL_UPLOAD_SIZE`'s fleet-deployed value (256 MiB) for
+/// [`ObjectWriter`]'s data-file parts, so manifest and data-file part sizes
+/// converge on the same practical upper bound -- a coincidence worth keeping
+/// rather than picking an unrelated number.
+const MANIFEST_MULTIPART_MAX_PART_SIZE: usize = 256 * 1024 * 1024;
 
 /// Chooses a part size for a manifest multipart upload of `total_len` bytes.
 ///
-/// Unlike [`ObjectWriter`]'s data-file path -- which sizes parts off
+/// Sizes parts so the part *count* matches `max_upload_parallelism()` (the
+/// same concurrency cap [`try_conditional_multipart_put`] uploads with) by
+/// default -- i.e. the whole upload fits in one wave of concurrent PUTs --
+/// rather than targeting some fixed, larger part count. With concurrency
+/// capped, more parts than the concurrency limit just means more waves: each
+/// wave pays a full request/response round trip before the next one starts,
+/// so bursting-then-idling across several waves is strictly worse than one
+/// wave that saturates the concurrency limit for the whole transfer.
+///
+/// This also means we deliberately do *not* reuse [`ObjectWriter`]'s
 /// `initial_upload_size()` / `LANCE_INITIAL_UPLOAD_SIZE` (256 MiB in
-/// production) because it's tuned for multi-GB to TB-scale data files --
-/// manifests are a very different shape: usually KBs, occasionally up to a
-/// few hundred MB. Reusing the data-file part size directly would mean a
-/// ~1 GB manifest uploads as a single ~1 GB part (no parallelism) while a
-/// ~300 MB manifest fits in one 256 MiB-rounded part too. Instead we target
-/// [`MANIFEST_MULTIPART_TARGET_PART_COUNT`] parts, with a
-/// [`MANIFEST_MULTIPART_MIN_PART_SIZE`] floor so we don't fragment a
-/// modestly-oversized manifest into many tiny parts. For example: a 1 GB
-/// manifest divides to ~10 MB/part, which the floor clamps up to 32 MiB (~32
-/// parts); a 10 GB manifest divides to ~100 MB/part, right at the target
-/// part count.
+/// production): that's tuned for its multi-GB-to-TB data-file case, and
+/// applied here would put most realistic manifests (KBs to a few hundred MB)
+/// in a single part with no parallelism at all.
+///
+/// [`MANIFEST_MULTIPART_MIN_PART_SIZE`] keeps manifests just over the
+/// multipart threshold from being chopped into many tiny parts (dividing by
+/// `max_upload_parallelism()` there would otherwise yield a part size near
+/// zero); this is a degenerate case near the threshold boundary that
+/// legitimately ends up as 1-2 parts rather than a full wave, which is fine.
+/// [`MANIFEST_MULTIPART_MAX_PART_SIZE`] keeps parts from growing unbounded
+/// for very large manifests, at the cost of exceeding the target part count
+/// (and thus taking more than one wave) once a manifest is large enough that
+/// even max-size parts don't fit within `max_upload_parallelism()`.
+///
+/// For example, with the default concurrency of 10: a 1 GiB manifest divides
+/// to ~102 MiB/part (10 parts, one wave, unaffected by the 256 MiB cap); a
+/// manifest just over the 8 MiB threshold divides to under the 32 MiB floor,
+/// clamping up to 1 part; a 100 GiB manifest would divide to ~10 GiB/part,
+/// clamped down to the 256 MiB cap, yielding ~400 parts across ~40 waves.
 fn manifest_multipart_part_size(total_len: usize) -> usize {
-    total_len
-        .div_ceil(MANIFEST_MULTIPART_TARGET_PART_COUNT)
-        .max(MANIFEST_MULTIPART_MIN_PART_SIZE)
+    let target_parts = max_upload_parallelism().max(1);
+    total_len.div_ceil(target_parts).clamp(
+        MANIFEST_MULTIPART_MIN_PART_SIZE,
+        MANIFEST_MULTIPART_MAX_PART_SIZE,
+    )
 }
 
 fn manifest_multipart_threshold() -> usize {
@@ -2443,12 +2465,13 @@ mod tests {
     /// wide-schema / huge-stats manifest: well into the hundreds of MB. At
     /// this size `manifest_multipart_part_size` is still on the
     /// `MANIFEST_MULTIPART_MIN_PART_SIZE` (32 MiB) floor rather than the
-    /// ~100-part target (see `test_manifest_multipart_part_size` for the
-    /// exact math across a range of sizes, including GB-scale ones this test
-    /// doesn't actually upload). The point here is to exercise the real
-    /// multipart upload path end-to-end -- not just the pure sizing function
-    /// -- at a size well beyond a toy few-MB payload, while staying cheap to
-    /// allocate and upload against the in-memory store in a unit test.
+    /// `total_len / max_upload_parallelism()` branch (see
+    /// `test_manifest_multipart_part_size` for the exact math across a range
+    /// of sizes, including GB-scale ones this test doesn't actually upload).
+    /// The point here is to exercise the real multipart upload path
+    /// end-to-end -- not just the pure sizing function -- at a size well
+    /// beyond a toy few-MB payload, while staying cheap to allocate and
+    /// upload against the in-memory store in a unit test.
     fn large_multipart_manifest_writer<'a>(
         object_store: &'a ObjectStore,
         _manifest: &'a mut Manifest,
@@ -2592,51 +2615,66 @@ mod tests {
     }
 
     /// Pure sizing check across realistic-to-huge manifest sizes, so the
-    /// "roughly 100 parts, 32 MiB floor" shape is verified without actually
-    /// allocating or uploading GB-scale payloads in a test.
+    /// "part count matches `max_upload_parallelism()` by default, 32 MiB
+    /// floor, 512 MiB cap" shape is verified without actually allocating or
+    /// uploading GB-scale payloads in a test.
+    ///
+    /// Assumes the default `max_upload_parallelism()` of 10 (no
+    /// `LANCE_UPLOAD_CONCURRENCY` override in the test environment), same as
+    /// other tests in this module assume `manifest_multipart_threshold()`'s
+    /// default.
     #[test]
     fn test_manifest_multipart_part_size() {
         const MIB: usize = 1024 * 1024;
         const GIB: usize = 1024 * MIB;
+        assert_eq!(
+            max_upload_parallelism(),
+            10,
+            "test assumes the default LANCE_UPLOAD_CONCURRENCY"
+        );
 
-        // Just over the (8 MiB default) multipart threshold: total_len/100
+        // Just over the (8 MiB default) multipart threshold: total_len/10
         // is far below the 32 MiB floor, so the floor wins and the whole
-        // payload fits in a single part.
+        // payload fits in a single part -- a degenerate case near the
+        // threshold boundary, not a full wave, and that's fine.
         let tiny = 8 * MIB + 1;
         let part_size = manifest_multipart_part_size(tiny);
         assert_eq!(part_size, MANIFEST_MULTIPART_MIN_PART_SIZE);
         assert_eq!(tiny.div_ceil(part_size), 1);
 
-        // 1 GB: total_len/100 (~10.7 MB) is still below the 32 MiB floor,
-        // so parts are floor-sized -- this is the case the human review
-        // flagged (previously ~128 parts at the old 8 MiB fixed part size;
-        // now ~32 parts at the 32 MiB floor).
-        let one_gb = GIB;
-        let part_size = manifest_multipart_part_size(one_gb);
-        assert_eq!(part_size, MANIFEST_MULTIPART_MIN_PART_SIZE);
-        let parts = one_gb.div_ceil(part_size);
-        assert_eq!(parts, 32);
-
-        // 10 GB: total_len/100 (~107 MB) now exceeds the 32 MiB floor, so
-        // the ~100-part target governs and part size scales up with total
-        // size instead of part count blowing past the target.
-        let ten_gb = 10 * GIB;
-        let part_size = manifest_multipart_part_size(ten_gb);
+        // 1 GiB: total_len/10 (~102 MiB) sits comfortably between the floor
+        // and cap, so it governs directly -- this is the case the human
+        // review flagged (previously ~128 parts at the old 8 MiB fixed part
+        // size, no concurrency cap; now 10 parts, matching the default
+        // concurrency limit, so the whole upload fits in one wave).
+        let one_gib = GIB;
+        let part_size = manifest_multipart_part_size(one_gib);
         assert!(
-            part_size > MANIFEST_MULTIPART_MIN_PART_SIZE,
-            "expected the target-part-count branch, not the floor, got part_size={part_size}"
+            part_size > MANIFEST_MULTIPART_MIN_PART_SIZE
+                && part_size < MANIFEST_MULTIPART_MAX_PART_SIZE,
+            "expected the total_len/parallelism branch, not a clamp, got part_size={part_size}"
         );
-        let parts = ten_gb.div_ceil(part_size);
-        assert_eq!(parts, MANIFEST_MULTIPART_TARGET_PART_COUNT);
+        let parts = one_gib.div_ceil(part_size);
+        assert_eq!(parts, max_upload_parallelism());
 
-        // 1 TB: even at this extreme, the target-part-count shape keeps
-        // part count at ~100, nowhere near S3's 10,000-part-per-upload
-        // limit.
-        let one_tb = 1024 * GIB;
-        let part_size = manifest_multipart_part_size(one_tb);
-        let parts = one_tb.div_ceil(part_size);
-        assert_eq!(parts, MANIFEST_MULTIPART_TARGET_PART_COUNT);
+        // 100 GiB: total_len/10 (~10 GiB) exceeds the 512 MiB cap, so parts
+        // are cap-sized and part count exceeds the concurrency limit --
+        // taking multiple waves is the expected tradeoff once a manifest is
+        // this large.
+        let hundred_gib = 100 * GIB;
+        let part_size = manifest_multipart_part_size(hundred_gib);
+        assert_eq!(part_size, MANIFEST_MULTIPART_MAX_PART_SIZE);
+        let parts = hundred_gib.div_ceil(part_size);
+        assert!(parts > max_upload_parallelism());
         assert!(parts < 10_000);
+
+        // 1 TiB: even at this extreme, the 512 MiB cap keeps part count
+        // nowhere near S3's 10,000-part-per-upload limit.
+        let one_tib = 1024 * GIB;
+        let part_size = manifest_multipart_part_size(one_tib);
+        assert_eq!(part_size, MANIFEST_MULTIPART_MAX_PART_SIZE);
+        let parts = one_tib.div_ceil(part_size);
+        assert!(parts < 10_000, "part count {parts} too close to S3's limit");
     }
 
     /// A manifest large enough that it would have been ~128 unbounded
