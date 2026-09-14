@@ -33,14 +33,13 @@ use super::manifest::write_manifest;
 use bytes::Bytes;
 use futures::Stream;
 use futures::future::Either;
-use futures::future::try_join_all;
 use futures::{
     StreamExt, TryStreamExt,
     future::{self, BoxFuture},
     stream::BoxStream,
 };
 use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
-use lance_io::object_writer::{ObjectWriter, WriteResult, get_etag};
+use lance_io::object_writer::{ObjectWriter, WriteResult, get_etag, max_upload_parallelism};
 use log::warn;
 use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::PutOptions;
@@ -1489,16 +1488,58 @@ impl Debug for RenameCommitHandler {
 ///
 /// Default: 8 MiB. Manifests are normally KBs in size; they only approach
 /// this threshold with very wide schemas or very large per-fragment
-/// statistics. The default is kept comfortably above that common case, while
-/// staying above `MIN_MULTIPART_PART_SIZE` so a manifest that does cross the
-/// threshold still uploads in a small, bounded number of parts. Override with
-/// the `LANCE_MANIFEST_MULTIPART_THRESHOLD` env var (bytes).
+/// statistics. The default is kept comfortably above that common case.
+/// Override with the `LANCE_MANIFEST_MULTIPART_THRESHOLD` env var (bytes).
+///
+/// This threshold is deliberately a separate knob from per-part sizing (see
+/// [`manifest_multipart_part_size`]): "is this manifest big enough to bother
+/// with multipart" and "how should a multipart upload be chunked" are
+/// different questions, and sharing one number meant raising this threshold
+/// to avoid multipart on medium-sized manifests would silently shrink or
+/// grow the part size too.
 const DEFAULT_MANIFEST_MULTIPART_THRESHOLD: usize = 8 * 1024 * 1024;
 
 /// Minimum size for a non-final multipart part. This mirrors the minimum
 /// enforced by S3 (and inherited by other backends): parts other than the
 /// last are rejected if they are smaller than this.
 const MIN_MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
+
+/// Target number of parts for a manifest multipart upload. Part size is
+/// derived from the manifest's total size so that it lands at roughly this
+/// many parts (see [`manifest_multipart_part_size`]), which keeps part count
+/// far below S3's 10,000-part-per-upload limit by construction: even a 1 TB
+/// manifest would need only ~100 parts at the resulting ~10 GiB part size
+/// (clamped to the 5 GiB per-part max enforced elsewhere).
+const MANIFEST_MULTIPART_TARGET_PART_COUNT: usize = 100;
+
+/// Floor for a manifest multipart part size. This is independent of --
+/// and much larger than -- [`MIN_MULTIPART_PART_SIZE`] (S3's hard minimum):
+/// it exists so that manifests just over the multipart threshold don't get
+/// split into a large number of tiny parts. E.g. a manifest just over the
+/// (8 MiB default) threshold would otherwise produce a part size near zero
+/// from `total_len / 100`; the floor keeps it to a single part instead.
+const MANIFEST_MULTIPART_MIN_PART_SIZE: usize = 32 * 1024 * 1024;
+
+/// Chooses a part size for a manifest multipart upload of `total_len` bytes.
+///
+/// Unlike [`ObjectWriter`]'s data-file path -- which sizes parts off
+/// `initial_upload_size()` / `LANCE_INITIAL_UPLOAD_SIZE` (256 MiB in
+/// production) because it's tuned for multi-GB to TB-scale data files --
+/// manifests are a very different shape: usually KBs, occasionally up to a
+/// few hundred MB. Reusing the data-file part size directly would mean a
+/// ~1 GB manifest uploads as a single ~1 GB part (no parallelism) while a
+/// ~300 MB manifest fits in one 256 MiB-rounded part too. Instead we target
+/// [`MANIFEST_MULTIPART_TARGET_PART_COUNT`] parts, with a
+/// [`MANIFEST_MULTIPART_MIN_PART_SIZE`] floor so we don't fragment a
+/// modestly-oversized manifest into many tiny parts. For example: a 1 GB
+/// manifest divides to ~10 MB/part, which the floor clamps up to 32 MiB (~32
+/// parts); a 10 GB manifest divides to ~100 MB/part, right at the target
+/// part count.
+fn manifest_multipart_part_size(total_len: usize) -> usize {
+    total_len
+        .div_ceil(MANIFEST_MULTIPART_TARGET_PART_COUNT)
+        .max(MANIFEST_MULTIPART_MIN_PART_SIZE)
+}
 
 fn manifest_multipart_threshold() -> usize {
     static THRESHOLD: OnceLock<usize> = OnceLock::new();
@@ -1554,16 +1595,27 @@ async fn try_conditional_multipart_put(
         Err(err) => return Err(CommitError::OtherError(err.into())),
     };
 
-    let part_size = manifest_multipart_threshold().max(MIN_MULTIPART_PART_SIZE);
-    let mut part_futures = Vec::with_capacity(data.len().div_ceil(part_size));
+    let part_size = manifest_multipart_part_size(data.len());
+    let mut parts = Vec::with_capacity(data.len().div_ceil(part_size));
     let mut offset = 0usize;
     while offset < data.len() {
         let end = (offset + part_size).min(data.len());
-        part_futures.push(upload.put_part(data.slice(offset..end).into()));
+        parts.push(data.slice(offset..end));
         offset = end;
     }
 
-    if let Err(err) = try_join_all(part_futures).await {
+    // Bound concurrency the same way `ObjectWriter`'s data-file multipart
+    // path does (`max_upload_parallelism()` / `LANCE_UPLOAD_CONCURRENCY`,
+    // default 10) -- nothing below us (object_store, or the underlying HTTP
+    // client) imposes an in-flight-request cap on its own, so without this
+    // an oversized manifest would fire off every part PUT at once.
+    let upload_result =
+        futures::stream::iter(parts.into_iter().map(|part| upload.put_part(part.into())))
+            .buffer_unordered(max_upload_parallelism())
+            .try_for_each(|_| future::ready(Ok(())))
+            .await;
+
+    if let Err(err) = upload_result {
         // A part failed, so we never reach `complete`. The object_store
         // crate only guarantees best-effort abort-on-failure from within
         // `complete` itself, so clean up here.
@@ -2345,6 +2397,26 @@ mod tests {
         );
     }
 
+    /// Writes a fixed-size, fixed-content payload as if it were the
+    /// manifest. Shared by the fn-pointer writers below -- `ManifestWriter`
+    /// is a plain `fn` type (not a closure), so it can't capture a size
+    /// parameter directly.
+    async fn write_fixed_payload(
+        object_store: &ObjectStore,
+        path: &Path,
+        len: usize,
+    ) -> Result<WriteResult> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut writer = ObjectWriter::new(object_store, path).await?;
+        let payload = vec![7u8; len];
+        writer
+            .write_all(&payload)
+            .await
+            .map_err(|e| Error::io_source(Box::new(e)))?;
+        Writer::shutdown(&mut writer).await
+    }
+
     /// A manifest writer that ignores the manifest content and instead writes
     /// a fixed-size payload, so tests can deterministically cross (or stay
     /// under) `manifest_multipart_threshold()`.
@@ -2355,23 +2427,47 @@ mod tests {
         path: &'a Path,
         _transaction: Option<Transaction>,
     ) -> BoxFuture<'a, Result<WriteResult>> {
-        use tokio::io::AsyncWriteExt;
-
-        Box::pin(async move {
-            let mut writer = ObjectWriter::new(object_store, path).await?;
-            let payload = vec![7u8; OVERSIZED_MANIFEST_PAYLOAD_LEN];
-            writer
-                .write_all(&payload)
-                .await
-                .map_err(|e| Error::io_source(Box::new(e)))?;
-            Writer::shutdown(&mut writer).await
-        })
+        Box::pin(write_fixed_payload(
+            object_store,
+            path,
+            OVERSIZED_MANIFEST_PAYLOAD_LEN,
+        ))
     }
 
     /// Comfortably above `DEFAULT_MANIFEST_MULTIPART_THRESHOLD` (8 MiB), so
     /// the commit handler takes the multipart path, and spans multiple parts
     /// at the default part size.
     const OVERSIZED_MANIFEST_PAYLOAD_LEN: usize = 9 * 1024 * 1024;
+
+    /// A manifest writer producing a payload realistically sized for a very
+    /// wide-schema / huge-stats manifest: well into the hundreds of MB. At
+    /// this size `manifest_multipart_part_size` is still on the
+    /// `MANIFEST_MULTIPART_MIN_PART_SIZE` (32 MiB) floor rather than the
+    /// ~100-part target (see `test_manifest_multipart_part_size` for the
+    /// exact math across a range of sizes, including GB-scale ones this test
+    /// doesn't actually upload). The point here is to exercise the real
+    /// multipart upload path end-to-end -- not just the pure sizing function
+    /// -- at a size well beyond a toy few-MB payload, while staying cheap to
+    /// allocate and upload against the in-memory store in a unit test.
+    fn large_multipart_manifest_writer<'a>(
+        object_store: &'a ObjectStore,
+        _manifest: &'a mut Manifest,
+        _indices: Option<Vec<IndexMetadata>>,
+        path: &'a Path,
+        _transaction: Option<Transaction>,
+    ) -> BoxFuture<'a, Result<WriteResult>> {
+        Box::pin(write_fixed_payload(
+            object_store,
+            path,
+            LARGE_MULTIPART_MANIFEST_PAYLOAD_LEN,
+        ))
+    }
+
+    /// 130 MiB: big enough to require multiple parts at the
+    /// `MANIFEST_MULTIPART_MIN_PART_SIZE` (32 MiB) floor, small enough to
+    /// allocate and upload cheaply in a unit test against the in-memory
+    /// store.
+    const LARGE_MULTIPART_MANIFEST_PAYLOAD_LEN: usize = 130 * 1024 * 1024;
 
     fn test_manifest() -> Manifest {
         use std::collections::HashMap;
@@ -2493,5 +2589,96 @@ mod tests {
 
         let bytes = object_store.read_one_all(&location.path).await.unwrap();
         assert_eq!(bytes.len(), size as usize);
+    }
+
+    /// Pure sizing check across realistic-to-huge manifest sizes, so the
+    /// "roughly 100 parts, 32 MiB floor" shape is verified without actually
+    /// allocating or uploading GB-scale payloads in a test.
+    #[test]
+    fn test_manifest_multipart_part_size() {
+        const MIB: usize = 1024 * 1024;
+        const GIB: usize = 1024 * MIB;
+
+        // Just over the (8 MiB default) multipart threshold: total_len/100
+        // is far below the 32 MiB floor, so the floor wins and the whole
+        // payload fits in a single part.
+        let tiny = 8 * MIB + 1;
+        let part_size = manifest_multipart_part_size(tiny);
+        assert_eq!(part_size, MANIFEST_MULTIPART_MIN_PART_SIZE);
+        assert_eq!(tiny.div_ceil(part_size), 1);
+
+        // 1 GB: total_len/100 (~10.7 MB) is still below the 32 MiB floor,
+        // so parts are floor-sized -- this is the case the human review
+        // flagged (previously ~128 parts at the old 8 MiB fixed part size;
+        // now ~32 parts at the 32 MiB floor).
+        let one_gb = GIB;
+        let part_size = manifest_multipart_part_size(one_gb);
+        assert_eq!(part_size, MANIFEST_MULTIPART_MIN_PART_SIZE);
+        let parts = one_gb.div_ceil(part_size);
+        assert_eq!(parts, 32);
+
+        // 10 GB: total_len/100 (~107 MB) now exceeds the 32 MiB floor, so
+        // the ~100-part target governs and part size scales up with total
+        // size instead of part count blowing past the target.
+        let ten_gb = 10 * GIB;
+        let part_size = manifest_multipart_part_size(ten_gb);
+        assert!(
+            part_size > MANIFEST_MULTIPART_MIN_PART_SIZE,
+            "expected the target-part-count branch, not the floor, got part_size={part_size}"
+        );
+        let parts = ten_gb.div_ceil(part_size);
+        assert_eq!(parts, MANIFEST_MULTIPART_TARGET_PART_COUNT);
+
+        // 1 TB: even at this extreme, the target-part-count shape keeps
+        // part count at ~100, nowhere near S3's 10,000-part-per-upload
+        // limit.
+        let one_tb = 1024 * GIB;
+        let part_size = manifest_multipart_part_size(one_tb);
+        let parts = one_tb.div_ceil(part_size);
+        assert_eq!(parts, MANIFEST_MULTIPART_TARGET_PART_COUNT);
+        assert!(parts < 10_000);
+    }
+
+    /// A manifest large enough that it would have been ~128 unbounded
+    /// concurrent parts under the old (threshold-as-part-size, no
+    /// concurrency cap) implementation now uploads as a small, bounded
+    /// number of parts and is still byte-for-byte correct.
+    #[tokio::test]
+    async fn test_conditional_put_commit_multipart_realistic_size() {
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("test");
+        let mut manifest = test_manifest();
+
+        let expected_parts = LARGE_MULTIPART_MANIFEST_PAYLOAD_LEN.div_ceil(
+            manifest_multipart_part_size(LARGE_MULTIPART_MANIFEST_PAYLOAD_LEN),
+        );
+        assert_eq!(
+            expected_parts, 5,
+            "test intends to exercise a handful of parts; update this assertion \
+             (and the comment on LARGE_MULTIPART_MANIFEST_PAYLOAD_LEN) if the sizing \
+             constants change"
+        );
+
+        let location = ConditionalPutCommitHandler
+            .commit(
+                &mut manifest,
+                None,
+                &base_path,
+                &object_store,
+                large_multipart_manifest_writer,
+                ManifestNamingScheme::V2,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            location.size,
+            Some(LARGE_MULTIPART_MANIFEST_PAYLOAD_LEN as u64)
+        );
+
+        let bytes = object_store.read_one_all(&location.path).await.unwrap();
+        assert_eq!(bytes.len(), LARGE_MULTIPART_MANIFEST_PAYLOAD_LEN);
+        assert!(bytes.iter().all(|&b| b == 7));
     }
 }

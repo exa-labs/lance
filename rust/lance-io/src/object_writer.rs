@@ -27,7 +27,13 @@ use tokio::runtime::Handle;
 /// Start at 5MB.
 const INITIAL_UPLOAD_STEP: usize = 1024 * 1024 * 5;
 
-fn max_upload_parallelism() -> usize {
+/// Maximum number of multipart parts to have in flight at once.
+///
+/// Respects the `LANCE_UPLOAD_CONCURRENCY` env var (default 10). This is
+/// `pub` (rather than crate-private) so other crates -- e.g. `lance-table`'s
+/// manifest multipart commit path -- can reuse the same tuning knob instead
+/// of inventing their own, which would risk drifting out of sync.
+pub fn max_upload_parallelism() -> usize {
     static MAX_UPLOAD_PARALLELISM: OnceLock<usize> = OnceLock::new();
     *MAX_UPLOAD_PARALLELISM.get_or_init(|| {
         std::env::var("LANCE_UPLOAD_CONCURRENCY")
