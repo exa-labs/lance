@@ -73,10 +73,9 @@ download \
   "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz" \
   "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00" \
   "${zig_archive}"
-if [[ ! -x "${zig_dir}/zig" ]]; then
-  mkdir -p "${zig_dir}"
-  tar -xJf "${zig_archive}" -C "${zig_dir}" --strip-components=1
-fi
+rm -rf -- "${zig_dir}"
+mkdir -p "${zig_dir}"
+tar -xJf "${zig_archive}" -C "${zig_dir}" --strip-components=1
 test "$("${zig_dir}/zig" version)" = "0.16.0"
 
 maturin_archive="${toolchain_dir}/maturin-x86_64-unknown-linux-musl-1.15.0.tar.gz"
@@ -85,10 +84,9 @@ download \
   "https://github.com/PyO3/maturin/releases/download/v1.15.0/maturin-x86_64-unknown-linux-musl.tar.gz" \
   "5a7d5226e83598b0c85881a0a03be16393ee2c0924b6f9d752951795825ac806" \
   "${maturin_archive}"
-if [[ ! -x "${maturin_dir}/maturin" ]]; then
-  mkdir -p "${maturin_dir}"
-  tar -xzf "${maturin_archive}" -C "${maturin_dir}"
-fi
+rm -rf -- "${maturin_dir}"
+mkdir -p "${maturin_dir}"
+tar -xzf "${maturin_archive}" -C "${maturin_dir}"
 test "$("${maturin_dir}/maturin" --version)" = "maturin 1.15.0"
 
 protoc_archive="${toolchain_dir}/protoc-24.4-linux-x86_64.zip"
@@ -97,10 +95,9 @@ download \
   "https://github.com/protocolbuffers/protobuf/releases/download/v24.4/protoc-24.4-linux-x86_64.zip" \
   "5871398dfd6ac954a6adebf41f1ae3a4de915a36a6ab2fd3e8f2c00d45b50dec" \
   "${protoc_archive}"
-if [[ ! -x "${protoc_dir}/bin/protoc" ]]; then
-  mkdir -p "${protoc_dir}"
-  unzip -q "${protoc_archive}" -d "${protoc_dir}"
-fi
+rm -rf -- "${protoc_dir}"
+mkdir -p "${protoc_dir}"
+unzip -q "${protoc_archive}" -d "${protoc_dir}"
 test "$("${protoc_dir}/bin/protoc" --version)" = "libprotoc 24.4"
 
 rustup toolchain install 1.91.0 --profile minimal --target "${target}"

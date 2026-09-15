@@ -8,15 +8,18 @@ fi
 
 wheel="$(realpath "$1")"
 platform="$2"
+wheel_name="$(basename "${wheel}")"
 
 case "${platform}" in
   x86_64)
     expected_machine="Advanced Micro Devices X86-64"
     expected_loader="ld-linux-x86-64.so.2"
+    expected_wheel_suffix="-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
     ;;
   aarch64)
     expected_machine="AArch64"
     expected_loader="ld-linux-aarch64.so.1"
+    expected_wheel_suffix="-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl"
     ;;
   *)
     echo "Unsupported platform: ${platform}" >&2
@@ -25,6 +28,7 @@ case "${platform}" in
 esac
 
 test -f "${wheel}"
+[[ "${wheel_name}" = *"${expected_wheel_suffix}" ]]
 work_dir="$(mktemp -d)"
 trap 'rm -rf "${work_dir}"' EXIT
 
