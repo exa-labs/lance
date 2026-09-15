@@ -29,6 +29,10 @@ test -x /usr/bin/clang
 test -x /usr/bin/clang++
 
 unset ARCHFLAGS
+unset NIX_CFLAGS_COMPILE
+unset NIX_CFLAGS_LINK
+unset NIX_HARDENING_ENABLE
+unset NIX_LDFLAGS
 unset _PYTHON_HOST_PLATFORM
 unset _PYTHON_SYSCONFIGDATA_NAME
 
@@ -108,7 +112,7 @@ source_commit="$(git -C "${source_dir}" rev-parse HEAD)"
 source_date_epoch="$(git -C "${source_dir}" show -s --format=%ct HEAD)"
 target_dir="${output_dir}/target"
 path_flags="-ffile-prefix-map=${source_dir}=/workspace/lance -fdebug-prefix-map=${source_dir}=/workspace/lance"
-rust_flags="--remap-path-prefix=${source_dir}=/workspace/lance --remap-path-prefix=${target_dir}=/workspace/target"
+rust_flags="-C link-arg=-Wl,--threads=1 --remap-path-prefix=${source_dir}=/workspace/lance --remap-path-prefix=${target_dir}=/workspace/target"
 target_suffix="${target//-/_}"
 target_cflags="${path_flags}"
 aws_lc_cflags="${path_flags}"
@@ -168,7 +172,7 @@ test -n "${wheel}"
   echo "maturin_archive_sha256=5a7d5226e83598b0c85881a0a03be16393ee2c0924b6f9d752951795825ac806"
   echo "protoc_archive_sha256=5871398dfd6ac954a6adebf41f1ae3a4de915a36a6ab2fd3e8f2c00d45b50dec"
   echo "${rust_version}"
-  "${zig_dir}/zig" env
-  "${maturin_dir}/maturin" --version
+  echo "zig_version=$("${zig_dir}/zig" version)"
+  echo "maturin_version=$("${maturin_dir}/maturin" --version)"
   sha256sum "${wheel}"
 } > "${wheel}.provenance.txt"

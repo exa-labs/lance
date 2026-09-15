@@ -51,6 +51,7 @@ if [[ "${sha_one}" != "${sha_two}" ]]; then
   exit 1
 fi
 
+cmp "${wheel_one}.provenance.txt" "${wheel_two}.provenance.txt"
 mkdir -p "${release_dir}/verified"
 cp "${wheel_one}" "${release_dir}/verified/"
 cp "${wheel_one}.provenance.txt" "${release_dir}/verified/"
