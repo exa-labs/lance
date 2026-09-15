@@ -34,7 +34,7 @@ Before publication, install the verified aarch64 wheel on an aarch64 host,
 start the repository LocalStack service, and run:
 
 ```shell
-wheel=/persistent/path/exa-wheel-aarch64/verified/*.whl
+wheel="$(find /persistent/path/exa-wheel-aarch64/verified -name '*.whl' -print -quit)"
 uv run --isolated --python 3.10 --with "${wheel}" --with boto3 \
   python .github/exa-release/test-wheel-s3.py
 ```
