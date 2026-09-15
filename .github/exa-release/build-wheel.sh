@@ -25,6 +25,8 @@ esac
 
 test "$(uname -s)" = "Linux"
 test "$(uname -m)" = "x86_64"
+test -x /usr/bin/clang
+test -x /usr/bin/clang++
 
 for command in curl diff git pkg-config readelf rustup sha256sum tar unzip xz; do
   command -v "${command}" >/dev/null
@@ -120,9 +122,11 @@ export "CARGO_TARGET_${target_env}_RUSTFLAGS=${rust_flags}"
 export "AWS_LC_SYS_CFLAGS_${target_suffix}=${aws_lc_cflags}"
 export "CFLAGS_${target_suffix}=${target_cflags}"
 export "CXXFLAGS_${target_suffix}=${target_cflags}"
+export CC=/usr/bin/clang
 export CARGO_INCREMENTAL=0
 export CARGO_NET_GIT_FETCH_WITH_CLI=true
 export CARGO_TARGET_DIR="${target_dir}"
+export CXX=/usr/bin/clang++
 export LANG=C
 export LC_ALL=C
 export PATH="${zig_dir}:${protoc_dir}/bin:${PATH}"
@@ -131,6 +135,10 @@ export RUSTUP_TOOLCHAIN=1.91.0
 export SOURCE_DATE_EPOCH="${source_date_epoch}"
 export TZ=UTC
 export ZERO_AR_DATE=1
+
+if [[ "${platform}" = "aarch64" ]]; then
+  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/clang
+fi
 
 (
   cd "${source_dir}/python"
