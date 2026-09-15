@@ -9,8 +9,10 @@ Release wheels are built from a clean checkout with immutable tool inputs:
 
 The downloaded Zig, maturin, and protoc archives are verified by SHA-256 before
 use. Cargo builds with `--locked`, the source commit timestamp controls archive
-timestamps, and source paths are remapped so independent checkouts can produce
-the same artifact.
+timestamps, and source paths are remapped. The reproduction command performs
+two clean checkouts sequentially at the same canonical build path because Rust
+ThinLTO output is sensitive to absolute build paths beyond diagnostic path
+remapping.
 
 From a clean Linux x86_64 checkout, reproduce each wheel twice:
 
