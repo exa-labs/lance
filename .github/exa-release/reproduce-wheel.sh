@@ -34,6 +34,7 @@ for run in 1 2; do
     "${source_dir}" \
     "${platform}" \
     "${output_dir}"
+  rm -rf -- "${output_dir}/target"
 done
 
 wheel_one="$(find "${release_dir}/run-1/dist" -maxdepth 1 -name "*${platform}*.whl" -print -quit)"
