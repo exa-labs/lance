@@ -111,6 +111,7 @@ grep -F "commit-hash: f8297e351a40c1439a467bbbb6879088047f50b3" <<<"${rust_versi
 source_commit="$(git -C "${source_dir}" rev-parse HEAD)"
 source_date_epoch="$(git -C "${source_dir}" show -s --format=%ct HEAD)"
 target_dir="${output_dir}/target"
+cargo_home="${target_dir}/cargo-home"
 path_flags="-ffile-prefix-map=${source_dir}=/workspace/lance -fdebug-prefix-map=${source_dir}=/workspace/lance"
 rust_flags="--remap-path-prefix=${source_dir}=/workspace/lance --remap-path-prefix=${target_dir}=/workspace/target"
 target_suffix="${target//-/_}"
@@ -126,11 +127,27 @@ fi
 
 target_env="${target^^}"
 target_env="${target_env//-/_}"
+mkdir -p "${cargo_home}"
+for cache in git registry; do
+  if [[ -d "${HOME}/.cargo/${cache}" ]]; then
+    ln -s "${HOME}/.cargo/${cache}" "${cargo_home}/${cache}"
+  fi
+done
+cat > "${cargo_home}/config.toml" <<'EOF'
+[unstable]
+host-config = true
+target-applies-to-host = false
+
+[host]
+linker = "/usr/bin/clang"
+EOF
+
 export "CARGO_TARGET_${target_env}_RUSTFLAGS=${rust_flags}"
 export "AWS_LC_SYS_CFLAGS_${target_suffix}=${aws_lc_cflags}"
 export "CFLAGS_${target_suffix}=${target_cflags}"
 export "CXXFLAGS_${target_suffix}=${target_cflags}"
 export CC=/usr/bin/clang
+export CARGO_HOME="${cargo_home}"
 export CARGO_INCREMENTAL=0
 export CARGO_NET_GIT_FETCH_WITH_CLI=true
 export CARGO_TARGET_DIR="${target_dir}"
@@ -143,10 +160,6 @@ export RUSTUP_TOOLCHAIN=1.91.0
 export SOURCE_DATE_EPOCH="${source_date_epoch}"
 export TZ=UTC
 export ZERO_AR_DATE=1
-
-if [[ "${platform}" = "aarch64" ]]; then
-  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/clang
-fi
 
 (
   cd "${source_dir}/python"
