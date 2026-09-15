@@ -133,7 +133,8 @@ for cache in git registry; do
     ln -s "${HOME}/.cargo/${cache}" "${cargo_home}/${cache}"
   fi
 done
-cat > "${cargo_home}/config.toml" <<'EOF'
+if [[ "${platform}" = "x86_64" ]]; then
+  cat > "${cargo_home}/config.toml" <<'EOF'
 [unstable]
 host-config = true
 target-applies-to-host = false
@@ -141,6 +142,9 @@ target-applies-to-host = false
 [host]
 linker = "/usr/bin/clang"
 EOF
+else
+  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/clang
+fi
 
 export "CARGO_TARGET_${target_env}_RUSTFLAGS=${rust_flags}"
 export "AWS_LC_SYS_CFLAGS_${target_suffix}=${aws_lc_cflags}"
