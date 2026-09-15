@@ -7,8 +7,10 @@ use std::vec;
 use crate::Dataset;
 use crate::dataset::UpdateBuilder;
 use crate::dataset::builder::DatasetBuilder;
+use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::datatypes::Schema;
+use lance_table::format::Fragment;
 use lance_table::io::commit::ManifestNamingScheme;
 
 use crate::dataset::write::{CommitBuilder, WriteMode, WriteParams};
@@ -27,6 +29,7 @@ use lance_core::Error;
 use object_store::path::Path;
 use rstest::rstest;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 fn assert_all_manifests_use_scheme(test_dir: &TempStdDir, scheme: ManifestNamingScheme) {
     let entries_names = test_dir
@@ -634,6 +637,140 @@ async fn test_fragment_id_never_reset() {
     assert_eq!(dataset.get_fragments()[0].id(), 3);
     assert_eq!(dataset.get_fragments()[1].id(), 4);
     assert_eq!(dataset.manifest.max_fragment_id(), Some(4));
+}
+
+/// `get_fragment` must agree with a linear scan of the manifest for every id,
+/// including ids the current version does not carry.
+fn assert_get_fragment_matches_linear_scan(dataset: &Dataset, absent_ids: &[usize]) {
+    for fragment in dataset.iter_fragments() {
+        let id = fragment.id as usize;
+        let resolved = dataset.get_fragment(id).unwrap();
+        assert_eq!(resolved.id(), id);
+        assert_eq!(
+            Some(resolved.metadata()),
+            dataset.iter_fragments().find(|f| f.id == id as u64)
+        );
+    }
+    for id in absent_ids {
+        assert!(dataset.get_fragment(*id).is_none(), "fragment {id}");
+        assert!(dataset.iter_fragments().all(|f| f.id != *id as u64));
+    }
+    let past_max = dataset
+        .manifest
+        .max_fragment_id()
+        .map_or(0, |id| id as usize + 1);
+    assert!(dataset.get_fragment(past_max).is_none());
+    assert!(dataset.get_fragment(u32::MAX as usize).is_none());
+    assert!(dataset.get_fragment(usize::MAX).is_none());
+}
+
+#[tokio::test]
+async fn test_get_fragment_with_id_gaps_across_versions() {
+    let test_uri = TempStrDir::default();
+
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::UInt32,
+        false,
+    )]));
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from_iter_values(0..60))],
+    )
+    .unwrap();
+    let batches = RecordBatchIterator::new(vec![Ok(data)], schema.clone());
+    let write_params = WriteParams {
+        max_rows_per_file: 10,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(batches, &test_uri, Some(write_params))
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 6);
+    assert_get_fragment_matches_linear_scan(&dataset, &[]);
+    let full_version = dataset.version().version;
+
+    // Delete whole fragments 1, 3 and 5 so the manifest carries ids 0, 2, 4.
+    dataset
+        .delete("(i >= 10 AND i < 20) OR (i >= 30 AND i < 40) OR i >= 50")
+        .await
+        .unwrap();
+    let remaining_ids: Vec<u64> = dataset.iter_fragments().map(|f| f.id).collect();
+    assert_eq!(remaining_ids, vec![0, 2, 4]);
+    assert_get_fragment_matches_linear_scan(&dataset, &[1, 3, 5]);
+
+    // An older version's handle resolves that version's fragment set.
+    let full_dataset = dataset.checkout_version(full_version).await.unwrap();
+    assert_eq!(full_dataset.get_fragments().len(), 6);
+    assert_get_fragment_matches_linear_scan(&full_dataset, &[]);
+    assert_get_fragment_matches_linear_scan(&dataset, &[1, 3, 5]);
+
+    // Compaction rewrites the remaining fragments under fresh ids.
+    compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    let compacted_ids: Vec<u64> = dataset.iter_fragments().map(|f| f.id).collect();
+    assert_eq!(compacted_ids, vec![6]);
+    assert_get_fragment_matches_linear_scan(&dataset, &[0, 1, 2, 3, 4, 5]);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 30);
+}
+
+fn install_fragments(dataset: &mut Dataset, fragments: Vec<Fragment>) {
+    let mut manifest = dataset.manifest.as_ref().clone();
+    manifest.fragments = Arc::new(fragments);
+    dataset.manifest = Arc::new(manifest);
+    dataset.fragment_bitmap = Arc::new(
+        dataset
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect(),
+    );
+}
+
+#[rstest]
+#[case::unsorted(vec![3, 1, 2, 0])]
+#[case::duplicate_ids(vec![0, 0, 2, 3])]
+#[tokio::test]
+async fn test_get_fragment_on_legacy_manifest(#[case] ids: Vec<u64>) {
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(4));
+    let mut dataset = Dataset::write(
+        data,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 10,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let by_id: HashMap<u64, Fragment> = dataset
+        .manifest
+        .fragments
+        .iter()
+        .map(|fragment| (fragment.id, fragment.clone()))
+        .collect();
+    let fragments = ids.iter().map(|id| by_id[id].clone()).collect();
+    install_fragments(&mut dataset, fragments);
+
+    for id in ids.iter().map(|id| *id as usize) {
+        let fragment = dataset.get_fragment(id).unwrap();
+        assert_eq!(
+            fragment.id(),
+            id,
+            "get_fragment({id}) returned the wrong fragment"
+        );
+        assert_eq!(
+            fragment.count_rows(None).await.unwrap(),
+            10,
+            "get_fragment({id}) returned unreadable metadata"
+        );
+    }
+    assert!(dataset.get_fragment(4).is_none());
 }
 
 /// create_branch and shallow_clone must read the SOURCE ref's chain, not the
