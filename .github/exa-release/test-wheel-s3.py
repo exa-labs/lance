@@ -44,11 +44,17 @@ service_error_markers = (
     "response error",
     "signaturedoesnotmatch",
 )
-for _ in range(20):
+
+
+def assert_s3_service_response() -> None:
     try:
         lance.dataset(https_uri, storage_options=credentials)
-    except OSError as error:
+    except (OSError, ValueError) as error:
         message = str(error).lower()
         assert any(marker in message for marker in service_error_markers), message
     else:
         raise AssertionError("Expected the non-dataset S3 path to fail")
+
+
+for _ in range(20):
+    assert_s3_service_response()
