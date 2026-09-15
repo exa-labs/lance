@@ -28,6 +28,10 @@ test "$(uname -m)" = "x86_64"
 test -x /usr/bin/clang
 test -x /usr/bin/clang++
 
+unset ARCHFLAGS
+unset _PYTHON_HOST_PLATFORM
+unset _PYTHON_SYSCONFIGDATA_NAME
+
 for command in curl diff git pkg-config readelf rustup sha256sum tar unzip xz; do
   command -v "${command}" >/dev/null
 done
