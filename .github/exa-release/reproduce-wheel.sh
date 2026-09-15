@@ -23,11 +23,13 @@ if [[ -n "$(find "${release_dir}" -mindepth 1 -print -quit)" ]]; then
   exit 1
 fi
 
+work_dir="${release_dir}/work"
+source_dir="${work_dir}/source"
+output_dir="${work_dir}/dist"
+
 for run in 1 2; do
   run_dir="${release_dir}/run-${run}"
-  source_dir="${run_dir}/source"
-  output_dir="${run_dir}/dist"
-  mkdir -p "${run_dir}"
+  rm -rf -- "${work_dir}"
   git clone --no-hardlinks --no-checkout "${repo_root}" "${source_dir}"
   git -C "${source_dir}" checkout --detach "${source_commit}"
   "${source_dir}/.github/exa-release/build-wheel.sh" \
@@ -35,10 +37,13 @@ for run in 1 2; do
     "${platform}" \
     "${output_dir}"
   rm -rf -- "${output_dir}/target"
+  mkdir -p "${run_dir}"
+  cp "${output_dir}"/*.whl "${output_dir}"/*.provenance.txt "${run_dir}/"
 done
+rm -rf -- "${work_dir}"
 
-wheel_one="$(find "${release_dir}/run-1/dist" -maxdepth 1 -name "*${platform}*.whl" -print -quit)"
-wheel_two="$(find "${release_dir}/run-2/dist" -maxdepth 1 -name "*${platform}*.whl" -print -quit)"
+wheel_one="$(find "${release_dir}/run-1" -maxdepth 1 -name "*${platform}*.whl" -print -quit)"
+wheel_two="$(find "${release_dir}/run-2" -maxdepth 1 -name "*${platform}*.whl" -print -quit)"
 test -n "${wheel_one}"
 test -n "${wheel_two}"
 
