@@ -75,6 +75,7 @@ use roaring::RoaringBitmap;
 use tracing::{Span, info_span, instrument};
 
 use super::Dataset;
+use crate::dataset::fragment::FileFragment;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
@@ -2234,6 +2235,29 @@ impl Scanner {
         Ok(filter_plan)
     }
 
+    /// Number of live rows the scan can visit: the rows of the fragments selected
+    /// with [`Self::with_fragments`], or of the whole dataset when none were.
+    ///
+    /// Counting the whole dataset when only a few fragments are scanned would
+    /// cost a pass over every fragment in the manifest, which dominates small
+    /// scans of datasets with millions of fragments.
+    async fn scanned_row_count(&self) -> Result<usize> {
+        match &self.fragments {
+            Some(fragments) => {
+                let counts = futures::stream::iter(fragments.iter().cloned())
+                    .map(|fragment| {
+                        let dataset = self.dataset.clone();
+                        async move { FileFragment::new(dataset, fragment).count_rows(None).await }
+                    })
+                    .buffer_unordered(16)
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                Ok(counts.iter().sum())
+            }
+            None => self.dataset.count_all_rows().await,
+        }
+    }
+
     async fn get_scan_range(&self, filter_plan: &ExprFilterPlan) -> Result<Option<Range<u64>>> {
         if filter_plan.has_any_filter() {
             // If there is a filter we can't pushdown limit / offset
@@ -2246,15 +2270,15 @@ impl Scanner {
             match (self.limit, self.offset) {
                 (None, None) => Ok(None),
                 (Some(limit), None) => {
-                    let num_rows = self.dataset.count_all_rows().await? as i64;
+                    let num_rows = self.scanned_row_count().await? as i64;
                     Ok(Some(0..limit.min(num_rows) as u64))
                 }
                 (None, Some(offset)) => {
-                    let num_rows = self.dataset.count_all_rows().await? as i64;
+                    let num_rows = self.scanned_row_count().await? as i64;
                     Ok(Some(offset.min(num_rows) as u64..num_rows as u64))
                 }
                 (Some(limit), Some(offset)) => {
-                    let num_rows = self.dataset.count_all_rows().await? as i64;
+                    let num_rows = self.scanned_row_count().await? as i64;
                     Ok(Some(
                         offset.min(num_rows) as u64..(offset + limit).min(num_rows) as u64,
                     ))
@@ -5254,6 +5278,58 @@ mod test {
 
         assert_eq!(actual.num_rows(), 2);
         assert_eq!(actual, full_data);
+        Ok(())
+    }
+
+    /// Limit / offset pushdown on a fragment subset is clamped by the rows of
+    /// those fragments, not of the whole dataset.
+    #[rstest]
+    #[tokio::test]
+    async fn test_limit_offset_with_fragments(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        let test_ds = TestVectorDataset::new(data_storage_version, false).await?;
+        let dataset = &test_ds.dataset;
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+        let second = fragments[1].metadata().clone();
+        let second_rows = fragments[1].count_rows(None).await?;
+        assert_eq!(second_rows, 200);
+
+        let full_second = dataset
+            .scan()
+            .with_fragments(vec![second.clone()])
+            .try_into_batch()
+            .await?;
+        assert_eq!(full_second.num_rows(), second_rows);
+
+        // Limit larger than the fragment: every row of the fragment, nothing else.
+        let actual = dataset
+            .scan()
+            .with_fragments(vec![second.clone()])
+            .limit(Some(1000), None)?
+            .try_into_batch()
+            .await?;
+        assert_eq!(actual, full_second);
+
+        // Offset inside the fragment: the tail of the fragment.
+        let actual = dataset
+            .scan()
+            .with_fragments(vec![second.clone()])
+            .limit(Some(5), Some(197))?
+            .try_into_batch()
+            .await?;
+        assert_eq!(actual, full_second.slice(197, 3));
+
+        // Offset past the fragment (but inside the dataset): no rows.
+        let actual = dataset
+            .scan()
+            .with_fragments(vec![second])
+            .limit(None, Some(250))?
+            .try_into_batch()
+            .await?;
+        assert_eq!(actual.num_rows(), 0);
         Ok(())
     }
 
