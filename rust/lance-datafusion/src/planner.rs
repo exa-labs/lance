@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::exec::{LanceExecutionOptions, get_session_context};
 use crate::expr::safe_coerce_scalar;
 use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
+use crate::signed_zero::{normalize_zero_comparisons, rewrite_signed_zero_comparisons};
 use crate::sql::{parse_sql_expr, parse_sql_filter};
 use arrow::compute::CastOptions;
 use arrow_array::ListArray;
@@ -17,8 +18,9 @@ use arrow_buffer::OffsetBuffer;
 use arrow_cast::cast_with_options;
 use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
 use arrow_select::concat::concat;
+use datafusion::catalog::Session;
 use datafusion::common::DFSchema;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::context::SessionState;
@@ -56,6 +58,31 @@ fn encode_jsonb(json_str: &str) -> Result<Expr> {
     let bytes = lance_arrow::json::encode_json(json_str)
         .map_err(|e| Error::invalid_input(format!("Failed to encode JSONB: {e}")))?;
     Ok(Expr::Literal(ScalarValue::LargeBinary(Some(bytes)), None))
+}
+
+// The escape in `LIKE/ILIKE ... ESCAPE '<char>'` must be exactly one character.
+// Reject empty or multi-character escape strings rather than silently treating
+// them as "no escape" or truncating to the first character.
+fn parse_like_escape_char(escape_char: &Option<ValueWithSpan>) -> Result<Option<char>> {
+    let Some(value) = escape_char else {
+        return Ok(None);
+    };
+    let ValueWithSpan {
+        value: Value::SingleQuotedString(escape),
+        ..
+    } = value
+    else {
+        return Err(Error::invalid_input(format!(
+            "Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {value}"
+        )));
+    };
+    let mut chars = escape.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Ok(Some(c)),
+        _ => Err(Error::invalid_input(format!(
+            "Invalid escape character in LIKE expression. Expected a single character, got '{escape}'"
+        ))),
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -332,6 +359,8 @@ impl Planner {
             BinaryOperator::NotEq => Operator::NotEq,
             BinaryOperator::And => Operator::And,
             BinaryOperator::Or => Operator::Or,
+            BinaryOperator::PGBitwiseShiftLeft => Operator::BitwiseShiftLeft,
+            BinaryOperator::PGBitwiseShiftRight => Operator::BitwiseShiftRight,
             _ => {
                 return Err(Error::invalid_input(format!(
                     "Operator {op} is not supported"
@@ -461,6 +490,8 @@ impl Planner {
             Cow::Borrowed(value)
         };
         if let Ok(n) = value.parse::<i64>() {
+            Ok(lit(n))
+        } else if let Ok(n) = value.parse::<u64>() {
             Ok(lit(n))
         } else {
             value.parse::<f64>().map(lit).map_err(|_| {
@@ -793,19 +824,7 @@ impl Planner {
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
                 Box::new(self.parse_sql_expr(pattern)?),
-                match escape_char {
-                    Some(ValueWithSpan {
-                        value: Value::SingleQuotedString(char),
-                        ..
-                    }) => char.chars().next(),
-                    Some(value) => {
-                        return Err(Error::invalid_input(format!(
-                            "Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}",
-                            value
-                        )));
-                    }
-                    None => None,
-                },
+                parse_like_escape_char(escape_char)?,
                 true,
             ))),
             SQLExpr::Like {
@@ -818,19 +837,7 @@ impl Planner {
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
                 Box::new(self.parse_sql_expr(pattern)?),
-                match escape_char {
-                    Some(ValueWithSpan {
-                        value: Value::SingleQuotedString(char),
-                        ..
-                    }) => char.chars().next(),
-                    Some(value) => {
-                        return Err(Error::invalid_input(format!(
-                            "Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}",
-                            value
-                        )));
-                    }
-                    None => None,
-                },
+                parse_like_escape_char(escape_char)?,
                 false,
             ))),
             // JSONB cast: CAST('...' AS JSONB) or '...'::jsonb
@@ -1006,6 +1013,43 @@ impl Planner {
     pub fn optimize_expr(&self, expr: Expr) -> Result<Expr> {
         let df_schema = Arc::new(DFSchema::try_from(self.schema.as_ref().clone())?);
 
+        // DataFusion rewrites arrow_cast to Expr::Cast, whose Arrow kernel does not support
+        // integer-to-Time32 casts. Convert literal values with Lance's scalar coercion first.
+        let expr = expr
+            .transform_up(|expr| {
+                let coerced = match &expr {
+                    Expr::ScalarFunction(ScalarFunction { func, args })
+                        if func.name() == "arrow_cast" =>
+                    {
+                        match args.as_slice() {
+                            [
+                                Expr::Literal(value, metadata),
+                                Expr::Literal(ScalarValue::Utf8(Some(data_type)), _),
+                            ] => data_type
+                                .parse::<ArrowDataType>()
+                                .ok()
+                                .filter(|data_type| matches!(data_type, ArrowDataType::Time32(_)))
+                                .and_then(|data_type| {
+                                    if matches!(value, ScalarValue::Null) {
+                                        ScalarValue::try_new_null(&data_type).ok()
+                                    } else {
+                                        safe_coerce_scalar(value, &data_type)
+                                    }
+                                })
+                                .map(|value| Expr::Literal(value, metadata.clone())),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+
+                Ok(match coerced {
+                    Some(coerced) => Transformed::yes(coerced),
+                    None => Transformed::no(expr),
+                })
+            })?
+            .data;
+
         // DataFusion needs the coerce and simplify passes to be applied before
         // expressions can be handled by the physical planner.
         let simplify_context = SimplifyContext::builder()
@@ -1017,7 +1061,24 @@ impl Planner {
 
         // Coerce before simplify to match DataFusion's analyzer-before-optimizer pipeline.
         let expr = simplifier.coerce(expr, &df_schema)?;
+
+        // Fold each comparison's own operands and rewrite it before anything above
+        // it folds. `simplify` folds an operand and everything above it in one
+        // pass, so a fully constant predicate whose zero appears only as a result
+        // of folding never presents a zero literal to the rewrite:
+        // `-1.0 * 0.0 < (1.0 - 1.0)` answered `true` where IEEE says false, and a
+        // wrapper such as `IS TRUE` or a `CAST` did the same to the comparison's
+        // own result.
+        let expr = normalize_zero_comparisons(expr, &|operand| simplifier.simplify(operand))?;
+
+        // Again after simplify, which is what expands `BETWEEN` into two
+        // comparisons and folds the casts `coerce` inserts, so those forms only
+        // become visible on this pass.
+        //
+        // Running the rewrite more than once is safe because its output is a fixed
+        // point of `optimize_expr`; `optimizing_twice_changes_nothing` pins that.
         let expr = simplifier.simplify(expr)?;
+        let expr = rewrite_signed_zero_comparisons(expr)?;
 
         Ok(expr)
     }
@@ -1030,6 +1091,16 @@ impl Planner {
             df_schema.as_ref(),
             &Default::default(),
         )?)
+    }
+
+    /// Create a [`PhysicalExpr`] using the caller's DataFusion session.
+    pub fn create_physical_expr_with_session(
+        &self,
+        expr: &Expr,
+        session: &dyn Session,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+        Ok(session.create_physical_expr(expr.clone(), &df_schema)?)
     }
 
     /// Collect the columns in the expression.
@@ -1106,8 +1177,8 @@ mod tests {
     use arrow::datatypes::Float64Type;
     use arrow_array::{
         ArrayRef, BooleanArray, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray,
-        StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-        TimestampNanosecondArray, TimestampSecondArray,
+        StructArray, Time32SecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
     };
     use arrow_schema::{DataType, Fields, Schema};
     use datafusion::{
@@ -1115,6 +1186,7 @@ mod tests {
         prelude::{array_element, get_field},
     };
     use datafusion_functions::core::expr_ext::FieldAccessor;
+    use rstest::rstest;
 
     #[test]
     fn test_parse_filter_simple() {
@@ -1185,6 +1257,29 @@ mod tests {
                 false, false, false, false, true, true, false, false, false, false
             ])
         );
+    }
+
+    #[test]
+    fn test_parse_filter_uint64_literal_above_i64_max() {
+        let value = u64::MAX - 1;
+        let batch = arrow_array::record_batch!(("id", UInt64, [1, value])).unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_filter(&format!("id = {value}")).unwrap();
+        assert_eq!(expr, col("id").eq(lit(value)));
+
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(vec![false, true])
+        );
+
+        let expr = planner
+            .parse_expr("arrow_cast(NULL, 'Time32(Second)')")
+            .unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        assert_eq!(expr, Expr::Literal(ScalarValue::Time32Second(None), None));
     }
 
     #[test]
@@ -1384,6 +1479,40 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::right("value >> 32", Operator::BitwiseShiftRight, vec![0, 1, 3])]
+    #[case::left(
+        "value << 1",
+        Operator::BitwiseShiftLeft,
+        vec![0, 2_u64 << 32, ((3_u64 << 32) + 7) << 1]
+    )]
+    fn test_bitwise_shift_expressions(
+        #[case] sql: &str,
+        #[case] expected_op: Operator,
+        #[case] expected: Vec<u64>,
+    ) {
+        let input = vec![0, 1_u64 << 32, (3_u64 << 32) + 7];
+        let batch =
+            RecordBatch::try_from_iter([("value", Arc::new(UInt64Array::from(input)) as ArrayRef)])
+                .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_expr(sql).unwrap();
+        let Expr::BinaryExpr(binary_expr) = &expr else {
+            panic!("expected binary expression for {sql}, got {expr}");
+        };
+        assert_eq!(binary_expr.op, expected_op);
+
+        let expr = planner.optimize_expr(expr).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let values = physical_expr
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        assert_eq!(values.as_ref(), &UInt64Array::from(expected));
+    }
+
     #[test]
     fn test_negative_array_expressions() {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
@@ -1460,6 +1589,36 @@ mod tests {
                 true, true, true, true, false, true, true, true, true, true
             ])
         );
+    }
+
+    #[test]
+    fn test_like_escape_char() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let planner = Planner::new(schema);
+
+        // A valid single-character escape is captured for both LIKE and ILIKE.
+        for filter in ["s LIKE 'a!%' ESCAPE '!'", "s ILIKE 'a!%' ESCAPE '!'"] {
+            match planner.parse_filter(filter).unwrap() {
+                Expr::Like(like) => assert_eq!(like.escape_char, Some('!'), "{filter}"),
+                other => panic!("expected a LIKE expression for `{filter}`, got {other:?}"),
+            }
+        }
+
+        // Empty and multi-character escapes are rejected rather than silently
+        // dropped or truncated to the first character.
+        for filter in [
+            "s LIKE 'x' ESCAPE ''",
+            "s LIKE 'x' ESCAPE 'ab'",
+            "s ILIKE 'x' ESCAPE ''",
+            "s ILIKE 'x' ESCAPE 'ab'",
+        ] {
+            let err = planner.parse_filter(filter).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("Invalid escape character in LIKE expression"),
+                "unexpected error for `{filter}`: {err}"
+            );
+        }
     }
 
     #[test]
@@ -1635,6 +1794,28 @@ mod tests {
                 _ => panic!("Expected binary expression"),
             }
         }
+    }
+
+    #[test]
+    fn test_arrow_cast_int_literal_to_time32() {
+        let batch = RecordBatch::try_from_iter([(
+            "v",
+            Arc::new(Time32SecondArray::from(vec![3725, 3726])) as ArrayRef,
+        )])
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner
+            .parse_filter("v = arrow_cast(3726, 'Time32(Second)')")
+            .unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(vec![false, true])
+        );
     }
 
     #[test]
