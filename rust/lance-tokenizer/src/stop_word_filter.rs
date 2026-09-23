@@ -4,6 +4,8 @@
 // Adapted from Tantivy v0.24.2 stop-word filter.
 // Copyright (c) 2017-present Tantivy contributors.
 
+#[path = "stop_word_filter/external.rs"]
+mod external;
 #[path = "stop_word_filter/stopwords.rs"]
 mod stopwords;
 
@@ -14,7 +16,7 @@ use crate::{Language, Token, TokenFilter, TokenStream, Tokenizer};
 
 fn all_stop_words() -> impl Iterator<Item = &'static str> {
     [
-        stop_words::get("ar"),
+        external::ARABIC,
         stopwords::DANISH,
         stopwords::DUTCH,
         // Use the fuller `stop-words` crate English list (~198 words) rather
@@ -22,24 +24,24 @@ fn all_stop_words() -> impl Iterator<Item = &'static str> {
         // common pronouns/function words (you, my, your, we, she, what, ...).
         // Those omissions let the highest-frequency English tokens through the
         // ICU stop-word path and build pathologically large posting lists.
-        stop_words::get("en"),
+        external::ENGLISH,
         stopwords::FINNISH,
         stopwords::FRENCH,
         stopwords::GERMAN,
-        stop_words::get("el"),
+        external::GREEK,
         stopwords::HUNGARIAN,
         stopwords::ITALIAN,
         stopwords::NORWEGIAN,
         stopwords::PORTUGUESE,
-        stop_words::get("ro"),
+        external::ROMANIAN,
         stopwords::RUSSIAN,
         stopwords::SPANISH,
         stopwords::SWEDISH,
-        stop_words::get("ta"),
-        stop_words::get("tr"),
-        stop_words::get("zh"),
-        stop_words::get("ja"),
-        stop_words::get("ko"),
+        external::TAMIL,
+        external::TURKISH,
+        external::CHINESE,
+        external::JAPANESE,
+        external::KOREAN,
     ]
     .into_iter()
     .flat_map(|words| words.iter().copied())
@@ -53,28 +55,28 @@ pub struct StopWordFilter {
 impl StopWordFilter {
     pub fn new(language: Language) -> Option<Self> {
         let words = match language {
-            Language::Arabic => stop_words::get("ar"),
+            Language::Arabic => external::ARABIC,
             Language::Danish => stopwords::DANISH,
             Language::Dutch => stopwords::DUTCH,
             // Use the fuller `stop-words` crate English list (~198 words); the
             // local Tantivy-style list (~33 words) omits common pronouns/function
             // words (you, my, your, we, ...) that would otherwise leak through
             // stop-word removal and build pathologically large posting lists.
-            Language::English => stop_words::get("en"),
+            Language::English => external::ENGLISH,
             Language::Finnish => stopwords::FINNISH,
             Language::French => stopwords::FRENCH,
             Language::German => stopwords::GERMAN,
-            Language::Greek => stop_words::get("el"),
+            Language::Greek => external::GREEK,
             Language::Hungarian => stopwords::HUNGARIAN,
             Language::Italian => stopwords::ITALIAN,
             Language::Norwegian => stopwords::NORWEGIAN,
             Language::Portuguese => stopwords::PORTUGUESE,
-            Language::Romanian => stop_words::get("ro"),
+            Language::Romanian => external::ROMANIAN,
             Language::Russian => stopwords::RUSSIAN,
             Language::Spanish => stopwords::SPANISH,
             Language::Swedish => stopwords::SWEDISH,
-            Language::Tamil => stop_words::get("ta"),
-            Language::Turkish => stop_words::get("tr"),
+            Language::Tamil => external::TAMIL,
+            Language::Turkish => external::TURKISH,
         };
         Some(Self::remove(words.iter().map(|word| (*word).to_owned())))
     }

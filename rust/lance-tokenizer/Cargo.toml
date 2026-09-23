@@ -36,7 +36,6 @@ frostem = { version = "1.20260804.0", default-features = false, features = [
     "turkish",
 ] }
 serde = { workspace = true, features = ["derive"] }
-stop-words = { version = "0.10.0", default-features = false, features = ["iso", "nltk"] }
 unicode-normalization = "0.1.25"
 
 [features]
