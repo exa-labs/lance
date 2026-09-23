@@ -3574,6 +3574,48 @@ async fn test_get_fragment_on_legacy_manifest(#[case] ids: Vec<u64>) {
     assert!(dataset.get_fragment(4).is_none());
 }
 
+/// A retained view drops the other fragments from every lookup path, including
+/// the bitmap-rank lookup behind take/scan fragment filters, and still reads
+/// the fragments it kept.
+#[tokio::test]
+async fn test_retain_fragments() {
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(4));
+    let dataset = Dataset::write(
+        data,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 10,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let retained = dataset.retain_fragments(|fragment| fragment.id % 2 == 1);
+
+    assert_eq!(dataset.fragments().len(), 4, "the source view is untouched");
+    let kept: Vec<u64> = retained.fragments().iter().map(|f| f.id).collect();
+    assert_eq!(kept, vec![1, 3]);
+    assert_eq!(retained.version().version, dataset.version().version);
+    for id in [0, 2] {
+        assert!(retained.get_fragment(id).is_none(), "fragment {id} dropped");
+    }
+    for id in [1, 3] {
+        let fragment = retained.get_fragment(id).unwrap();
+        assert_eq!(fragment.id(), id);
+        assert_eq!(fragment.count_rows(None).await.unwrap(), 10);
+    }
+
+    let resolved: Vec<Option<usize>> = retained
+        .get_frags_from_ordered_ids(&[0, 1, 2, 3])
+        .into_iter()
+        .map(|fragment| fragment.map(|f| f.id()))
+        .collect();
+    assert_eq!(resolved, vec![None, Some(1), None, Some(3)]);
+}
+
 async fn write_tiny_dataset(uri: &str) -> Dataset {
     let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
         "i",

@@ -2769,6 +2769,33 @@ impl Dataset {
         &self.manifest.fragments
     }
 
+    /// A read-only view of this version whose manifest holds only the
+    /// fragments `keep` accepts.
+    ///
+    /// The rest of the manifest (schema, indices, version, ...) is shared with
+    /// `self`, and the fragment id bitmap is rebuilt from the retained list, so
+    /// every fragment lookup (`get_fragment`, `get_frags_from_ordered_ids`,
+    /// take and scan fragment filters) resolves against the pruned list. Meant
+    /// for readers that serve a known subset of a very large manifest and want
+    /// the other fragments out of memory.
+    ///
+    /// Do not write through the returned dataset: a transaction built from it
+    /// does not see the dropped fragments.
+    pub fn retain_fragments(&self, mut keep: impl FnMut(&Fragment) -> bool) -> Self {
+        let mut manifest = self.manifest.as_ref().clone();
+        manifest.fragments = Arc::new(
+            self.manifest
+                .fragments
+                .iter()
+                .filter(|fragment| keep(fragment))
+                .cloned()
+                .collect(),
+        );
+        let mut dataset = self.clone();
+        dataset.set_manifest(Arc::new(manifest), self.manifest_location.clone());
+        dataset
+    }
+
     pub(crate) fn normalize_fragment_ids(fragment_ids: &[u32]) -> Vec<u32> {
         let mut ids = fragment_ids.to_vec();
         ids.sort_unstable();
