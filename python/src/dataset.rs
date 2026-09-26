@@ -2954,7 +2954,7 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false, commit_timeout = None))]
+    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false, commit_timeout = None, idempotency_property = None))]
     fn commit(
         dest: PyWriteDest,
         operation: PyLance<Operation>,
@@ -2970,6 +2970,7 @@ impl Dataset {
         table_id: Option<Vec<String>>,
         namespace_client_managed_versioning: bool,
         commit_timeout: Option<std::time::Duration>,
+        idempotency_property: Option<String>,
     ) -> PyResult<Self> {
         let mut transaction = Transaction::new(read_version.unwrap_or_default(), operation.0, None);
 
@@ -2993,13 +2994,14 @@ impl Dataset {
             table_id,
             namespace_client_managed_versioning,
             commit_timeout,
+            idempotency_property,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[staticmethod]
-    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false, commit_timeout = None))]
+    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false, commit_timeout = None, idempotency_property = None))]
     fn commit_transaction(
         dest: PyWriteDest,
         transaction: PyLance<Transaction>,
@@ -3013,6 +3015,7 @@ impl Dataset {
         table_id: Option<Vec<String>>,
         namespace_client_managed_versioning: bool,
         commit_timeout: Option<std::time::Duration>,
+        idempotency_property: Option<String>,
     ) -> PyResult<Self> {
         let accessor =
             crate::storage_options::create_accessor_from_storage_options(storage_options.clone())?;
@@ -3065,6 +3068,10 @@ impl Dataset {
 
         if let Some(enable) = enable_stable_row_ids {
             builder = builder.use_stable_row_ids(enable);
+        }
+
+        if let Some(property) = idempotency_property {
+            builder = builder.with_idempotency_property(property);
         }
 
         if let Some(store_params) = object_store_params {

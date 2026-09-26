@@ -167,6 +167,19 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Check this commit's idempotency keys against every transaction
+    /// committed after the read version.
+    ///
+    /// `property` names a transaction property holding a JSON array of
+    /// strings. If a transaction committed between the read version and the
+    /// version this commit creates carries any of the same keys, the commit
+    /// fails with [`lance_core::Error::DuplicateTransaction`] instead of
+    /// rebasing. Transactions without the property are not affected.
+    pub fn with_idempotency_property(mut self, property: impl Into<String>) -> Self {
+        self.commit_config.idempotency_property = Some(property.into());
+        self
+    }
+
     pub fn with_skip_auto_cleanup(mut self, skip_auto_cleanup: bool) -> Self {
         self.commit_config.skip_auto_cleanup = skip_auto_cleanup;
         self
