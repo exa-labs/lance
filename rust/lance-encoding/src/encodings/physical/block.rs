@@ -140,8 +140,25 @@ mod zstd {
 
     use super::*;
 
-    use ::zstd::bulk::{Compressor, decompress_to_buffer};
+    use ::zstd::bulk::{Compressor, Decompressor};
     use ::zstd::stream::copy_decode;
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// One reusable decompression context per thread: decode tasks run on a
+        /// shared pool, so a per-thread context avoids both per-value context
+        /// setup and cross-thread lock contention.
+        static DECOMPRESSOR: RefCell<Option<Decompressor<'static>>> = const { RefCell::new(None) };
+    }
+
+    /// Appends into `buf`'s spare capacity (reserved by the caller) without
+    /// zero-filling it first; zstd writes the bytes and the cursor sets the length.
+    fn append_cursor(buf: &mut Vec<u8>) -> Cursor<&mut Vec<u8>> {
+        let start = buf.len() as u64;
+        let mut cursor = Cursor::new(buf);
+        cursor.set_position(start);
+        cursor
+    }
 
     /// A zstd buffer compressor that lazily creates and reuses compression contexts.
     ///
@@ -149,13 +166,11 @@ mod zstd {
     /// page. It is lazily initialized to prevent it from getting initialized on
     /// decode-only codepaths.
     ///
-    /// Reuse is not implemented for decompression, only for compression:
-    /// * The single-threaded benefit of reuse was negligible when measured.
-    /// * Decompressors can get shared across threads, leading to mutex
-    ///   contention if the same strategy is used as for compression here. This
-    ///   should be mitigable with pooling but we can skip the complexity until a
-    ///   need is demonstrated. The multithreaded decode benchmark effectively
-    ///   demonstrates this scenario.
+    /// Decompression does not share this compressor's mutex-guarded context:
+    /// decode tasks run concurrently on a shared pool, so a shared context would
+    /// serialize them. Each thread instead keeps its own decompression context
+    /// (see `DECOMPRESSOR`), which avoids both per-value context setup and lock
+    /// contention.
     pub struct ZstdBufferCompressor {
         compression_level: i32,
         compressor: OnceLock<std::result::Result<Mutex<Compressor<'static>>, String>>,
@@ -236,11 +251,22 @@ mod zstd {
 
             let uncompressed_len = u64::from_le_bytes(len_buf) as usize;
 
-            let start = output_buf.len();
-            output_buf.resize(start + uncompressed_len, 0);
-
+            output_buf.reserve(uncompressed_len);
             let compressed_data = &input_buf[LENGTH_PREFIX_SIZE..];
-            decompress_to_buffer(compressed_data, &mut output_buf[start..])?;
+            let written = DECOMPRESSOR.with(|slot| -> std::io::Result<usize> {
+                let mut slot = slot.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(Decompressor::new()?);
+                }
+                slot.as_mut()
+                    .expect("initialized above")
+                    .decompress_to_buffer(compressed_data, &mut append_cursor(output_buf))
+            })?;
+            if written != uncompressed_len {
+                return Err(Error::internal(format!(
+                    "Zstd decompressed {written} bytes, expected {uncompressed_len}"
+                )));
+            }
             Ok(())
         }
     }
@@ -249,18 +275,12 @@ mod zstd {
         fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
             output_buf.write_all(&(input_buf.len() as u64).to_le_bytes())?;
 
-            let max_compressed_size = ::zstd::zstd_safe::compress_bound(input_buf.len());
-            let start_pos = output_buf.len();
-            output_buf.resize(start_pos + max_compressed_size, 0);
-
-            let compressed_size = self
-                .get_compressor()?
+            output_buf.reserve(::zstd::zstd_safe::compress_bound(input_buf.len()));
+            self.get_compressor()?
                 .lock()
                 .unwrap()
-                .compress_to_buffer(input_buf, &mut output_buf[start_pos..])
+                .compress_to_buffer(input_buf, &mut append_cursor(output_buf))
                 .map_err(|e| Error::internal(format!("Zstd compression error: {}", e)))?;
-
-            output_buf.truncate(start_pos + compressed_size);
             Ok(())
         }
 
@@ -679,6 +699,48 @@ mod tests {
                 .decompress(&compressed_data, &mut decompressed_data)
                 .unwrap();
             assert_eq!(input_data, decompressed_data.as_slice());
+        }
+
+        /// Compression and decompression append into the buffer's spare capacity
+        /// without zero-filling it first. Round-trip across sizes (including empty
+        /// and incompressible inputs), levels, pre-existing buffer contents, and
+        /// spare capacity left over from earlier writes; the prefix must survive
+        /// and every byte past it must be exactly what zstd produced.
+        #[test]
+        fn test_zstd_append_into_spare_capacity_round_trips() {
+            let mut state = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let sizes = [0usize, 1, 7, 64, 4095, 65_536, 1 << 20];
+            for level in [0, 1, 3, 9] {
+                let compressor = ZstdBufferCompressor::new(level);
+                for &size in &sizes {
+                    let inputs: [Vec<u8>; 3] = [
+                        (0..size).map(|_| next() as u8).collect(),
+                        (0..size).map(|i| b"lance zstd "[i % 11]).collect(),
+                        vec![0u8; size],
+                    ];
+                    for input in &inputs {
+                        let prefix = b"existing-prefix".to_vec();
+                        let mut compressed = Vec::with_capacity(prefix.len() + 3);
+                        compressed.extend_from_slice(&prefix);
+                        compressor.compress(input, &mut compressed).unwrap();
+                        assert_eq!(&compressed[..prefix.len()], &prefix[..]);
+
+                        let mut decompressed = Vec::with_capacity(4);
+                        decompressed.extend_from_slice(b"xy");
+                        compressor
+                            .decompress(&compressed[prefix.len()..], &mut decompressed)
+                            .unwrap();
+                        assert_eq!(&decompressed[..2], b"xy");
+                        assert_eq!(&decompressed[2..], &input[..]);
+                    }
+                }
+            }
         }
 
         #[test]
