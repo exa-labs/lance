@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    hash::BuildHasher,
+    sync::{Arc, OnceLock},
+};
 
 /// Bits per value for FixedWidth dictionary values (legacy default for 128-bit values)
 pub const DICT_FIXED_WIDTH_BITS_PER_VALUE: u64 = 128;
@@ -20,6 +24,7 @@ use arrow_buffer::ArrowNativeType;
 use arrow_schema::DataType;
 use arrow_select::take::TakeOptions;
 use lance_core::{Error, Result, error::LanceOptionExt, utils::hash::U8SliceKey};
+use xxhash_rust::xxh3::Xxh3Builder;
 
 use crate::{
     buffer::LanceBuffer,
@@ -110,6 +115,27 @@ pub fn normalize_dict_nulls(array: Arc<dyn Array>) -> Result<Arc<dyn Array>> {
     }
 }
 
+/// Hasher for the dictionary-building maps: xxh3 (fast on short keys) with a
+/// per-process random seed. Dictionary keys are column values, which may be
+/// externally supplied, so a fixed seed would let crafted inputs collide into
+/// one bucket chain; the seed keeps probing cost unpredictable without SipHash.
+/// Output does not depend on the hasher: dictionary order is first occurrence.
+fn dictionary_hasher() -> Xxh3Builder {
+    static HASHER: OnceLock<Xxh3Builder> = OnceLock::new();
+    *HASHER.get_or_init(|| {
+        let seed =
+            std::collections::hash_map::RandomState::new().hash_one(0x6c61_6e63_655f_6469_u64);
+        Xxh3Builder::new().with_seed(seed)
+    })
+}
+
+/// Initial capacity for a dictionary-encoding hash map: one slot per distinct
+/// value it may hold, so it never rehashes while building. Growth-driven
+/// rehashing dominated the dictionary encoder's CPU on high-cardinality pages.
+fn dictionary_map_capacity(num_values: u64, max_dict_entries: u32) -> usize {
+    num_values.min(u64::from(max_dict_entries)) as usize
+}
+
 fn dict_encode_variable_width<T>(
     variable_width_data_block: &VariableWidthBlock,
     bits_per_offset: u8,
@@ -121,7 +147,10 @@ where
     usize: TryFrom<T>,
 {
     use std::collections::hash_map::Entry;
-    let mut map = HashMap::new();
+    let mut map = HashMap::with_capacity_and_hasher(
+        dictionary_map_capacity(variable_width_data_block.num_values, max_dict_entries),
+        dictionary_hasher(),
+    );
     let offsets = variable_width_data_block
         .offsets
         .borrow_to_typed_slice::<T>();
@@ -233,7 +262,13 @@ pub fn dictionary_encode(
 
             match fixed_width_data_block.bits_per_value {
                 64 => {
-                    let mut map = HashMap::new();
+                    let mut map = HashMap::with_capacity_and_hasher(
+                        dictionary_map_capacity(
+                            fixed_width_data_block.num_values,
+                            max_dict_entries,
+                        ),
+                        dictionary_hasher(),
+                    );
                     let u64_slice = fixed_width_data_block.data.borrow_to_typed_slice::<u64>();
                     let u64_slice = u64_slice.as_ref();
                     let mut dictionary_buffer =
@@ -289,7 +324,13 @@ pub fn dictionary_encode(
                 }
                 128 => {
                     // TODO: a follow up PR to support `FixedWidth DataBlock with bits_per_value == 256`.
-                    let mut map = HashMap::new();
+                    let mut map = HashMap::with_capacity_and_hasher(
+                        dictionary_map_capacity(
+                            fixed_width_data_block.num_values,
+                            max_dict_entries,
+                        ),
+                        dictionary_hasher(),
+                    );
                     let u128_slice = fixed_width_data_block.data.borrow_to_typed_slice::<u128>();
                     let u128_slice = u128_slice.as_ref();
                     let mut dictionary_buffer =
@@ -374,8 +415,120 @@ mod tests {
         buffer::LanceBuffer,
         data::{BlockInfo, FixedWidthDataBlock},
     };
-    use arrow_array::{Array, StringArray};
+    use arrow_array::{Array, BinaryArray, LargeStringArray, StringArray};
+    use std::hash::BuildHasher;
     use std::sync::Arc;
+
+    /// Dictionary and per-row indices computed without any hash map: values in
+    /// order of first occurrence. The encoder's output must equal this exactly,
+    /// whatever hasher or map capacity it uses internally.
+    fn reference_dictionary<T: Clone + PartialEq>(values: &[T]) -> (Vec<T>, Vec<i32>) {
+        let mut dictionary: Vec<T> = Vec::new();
+        let indices = values
+            .iter()
+            .map(
+                |value| match dictionary.iter().position(|seen| seen == value) {
+                    Some(index) => index as i32,
+                    None => {
+                        dictionary.push(value.clone());
+                        (dictionary.len() - 1) as i32
+                    }
+                },
+            )
+            .collect();
+        (dictionary, indices)
+    }
+
+    fn indices_of(block: &DataBlock) -> Vec<i32> {
+        let DataBlock::FixedWidth(indices) = block else {
+            panic!("expected fixed-width indices, got {block:?}");
+        };
+        assert_eq!(indices.bits_per_value, DICT_INDICES_BITS_PER_VALUE);
+        indices
+            .data
+            .borrow_to_typed_slice::<i32>()
+            .as_ref()
+            .to_vec()
+    }
+
+    fn variable_dictionary_of(block: &DataBlock) -> Vec<Vec<u8>> {
+        let DataBlock::VariableWidth(dictionary) = block else {
+            panic!("expected variable-width dictionary, got {block:?}");
+        };
+        let offsets: Vec<usize> = match dictionary.bits_per_offset {
+            32 => dictionary
+                .offsets
+                .borrow_to_typed_slice::<i32>()
+                .as_ref()
+                .iter()
+                .map(|&o| o as usize)
+                .collect(),
+            64 => dictionary
+                .offsets
+                .borrow_to_typed_slice::<i64>()
+                .as_ref()
+                .iter()
+                .map(|&o| o as usize)
+                .collect(),
+            other => panic!("unexpected offset width {other}"),
+        };
+        assert_eq!(offsets.len() as u64, dictionary.num_values + 1);
+        offsets
+            .windows(2)
+            .map(|w| dictionary.data[w[0]..w[1]].to_vec())
+            .collect()
+    }
+
+    fn fixed_dictionary_of<T: arrow_buffer::ArrowNativeType>(block: &DataBlock) -> Vec<T> {
+        let DataBlock::FixedWidth(dictionary) = block else {
+            panic!("expected fixed-width dictionary, got {block:?}");
+        };
+        dictionary
+            .data
+            .borrow_to_typed_slice::<T>()
+            .as_ref()
+            .to_vec()
+    }
+
+    /// Dictionary-encodes `array` with a generous budget and asserts the result
+    /// equals the reference built from `values` (the array's values as bytes).
+    fn assert_variable_matches_reference(array: Arc<dyn Array>, values: &[Vec<u8>]) {
+        let block = DataBlock::from_array(array);
+        let (indices, dictionary) =
+            dictionary_encode(&block, u32::MAX, usize::MAX).expect("dictionary encoding");
+        let (expected_dictionary, expected_indices) = reference_dictionary(values);
+        assert_eq!(variable_dictionary_of(&dictionary), expected_dictionary);
+        assert_eq!(indices_of(&indices), expected_indices);
+    }
+
+    fn fixed_block<T: arrow_buffer::ArrowNativeType>(values: Vec<T>, bits: u64) -> DataBlock {
+        let num_values = values.len() as u64;
+        let mut block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: bits,
+            data: LanceBuffer::reinterpret_vec(values),
+            num_values,
+            block_info: BlockInfo::default(),
+        });
+        block.compute_stat();
+        block
+    }
+
+    /// Keys that stress a byte-slice hash: empty, all-prefixes-of-each-other,
+    /// long shared prefixes differing only at the end, and multi-byte UTF-8.
+    fn tricky_string_keys() -> Vec<String> {
+        let mut keys = vec![String::new()];
+        keys.extend((1..=64).map(|n| "k".repeat(n)));
+        let shared = "p".repeat(1024);
+        keys.extend((0..64).map(|i| format!("{shared}{i:03}")));
+        keys.extend(["héllo", "日本語", "🦀", "a\u{0}b", "\u{0}"].map(String::from));
+        keys
+    }
+
+    fn rows_from(keys: &[String], num_rows: usize) -> Vec<String> {
+        (0..num_rows)
+            .map(|i| keys[(i * 7 + i / 3) % keys.len()].clone())
+            .collect()
+    }
 
     #[test]
     fn test_dictionary_encode_abort_fixed_width() {
@@ -569,5 +722,171 @@ mod tests {
         let max_encoded_size = usize::try_from(data_block.data_size()).unwrap_or(usize::MAX);
         assert!(dictionary_encode(&data_block, 10, max_encoded_size).is_none());
         assert!(dictionary_encode(&data_block, 500, max_encoded_size).is_some());
+    }
+
+    #[test]
+    fn test_dictionary_encode_utf8_matches_reference() {
+        let rows = rows_from(&tricky_string_keys(), 5_000);
+        let bytes: Vec<Vec<u8>> = rows.iter().map(|r| r.as_bytes().to_vec()).collect();
+        assert_variable_matches_reference(Arc::new(StringArray::from(rows.clone())), &bytes);
+        assert_variable_matches_reference(Arc::new(LargeStringArray::from(rows)), &bytes);
+    }
+
+    #[test]
+    fn test_dictionary_encode_binary_matches_reference() {
+        // Arbitrary bytes, including invalid UTF-8 and values that differ only in length.
+        let keys: Vec<Vec<u8>> = (0..300u32)
+            .map(|i| {
+                (0..(i % 37))
+                    .map(|j| ((i.wrapping_mul(131) ^ (j * 7)) as u8) | 0x80)
+                    .collect()
+            })
+            .collect();
+        let rows: Vec<Vec<u8>> = (0..6_000)
+            .map(|i| keys[(i * 13) % keys.len()].clone())
+            .collect();
+        let array = BinaryArray::from_iter_values(rows.iter());
+        assert_variable_matches_reference(Arc::new(array), &rows);
+    }
+
+    #[test]
+    fn test_dictionary_encode_u64_matches_reference() {
+        let keys = [
+            0u64,
+            1,
+            u64::MAX,
+            u64::MAX - 1,
+            1 << 32,
+            1 << 63,
+            0xdead_beef,
+        ];
+        let rows: Vec<u64> = (0..4_000)
+            .map(|i| keys[(i * 5 + i / 11) % keys.len()])
+            .collect();
+        let (indices, dictionary) =
+            dictionary_encode(&fixed_block(rows.clone(), 64), u32::MAX, usize::MAX)
+                .expect("dictionary encoding");
+        let (expected_dictionary, expected_indices) = reference_dictionary(&rows);
+        assert_eq!(fixed_dictionary_of::<u64>(&dictionary), expected_dictionary);
+        assert_eq!(indices_of(&indices), expected_indices);
+    }
+
+    #[test]
+    fn test_dictionary_encode_u128_matches_reference() {
+        // Values that differ only in the high or only in the low 64 bits.
+        let keys = [0u128, 1, 1 << 64, (1 << 64) | 1, u128::MAX, u128::MAX << 64];
+        let rows: Vec<u128> = (0..4_000)
+            .map(|i| keys[(i * 3 + i / 7) % keys.len()])
+            .collect();
+        let (indices, dictionary) = dictionary_encode(
+            &fixed_block(rows.clone(), DICT_FIXED_WIDTH_BITS_PER_VALUE),
+            u32::MAX,
+            usize::MAX,
+        )
+        .expect("dictionary encoding");
+        let (expected_dictionary, expected_indices) = reference_dictionary(&rows);
+        assert_eq!(
+            fixed_dictionary_of::<u128>(&dictionary),
+            expected_dictionary
+        );
+        assert_eq!(indices_of(&indices), expected_indices);
+    }
+
+    /// Exactly `max_dict_entries` distinct values encode; one more aborts; a cap
+    /// of zero always aborts. Checked for every map the encoder builds.
+    #[test]
+    fn test_dictionary_encode_entry_cap_boundaries() {
+        let cardinality = 257usize;
+        let strings: Vec<String> = (0..cardinality * 4)
+            .map(|i| format!("v{}", i % cardinality))
+            .collect();
+        let variable =
+            DataBlock::from_array(Arc::new(StringArray::from(strings)) as Arc<dyn Array>);
+        let u64s = fixed_block(
+            (0..cardinality * 4)
+                .map(|i| (i % cardinality) as u64)
+                .collect(),
+            64,
+        );
+        let u128s = fixed_block(
+            (0..cardinality * 4)
+                .map(|i| (i % cardinality) as u128)
+                .collect(),
+            DICT_FIXED_WIDTH_BITS_PER_VALUE,
+        );
+        for block in [&variable, &u64s, &u128s] {
+            let (_, dictionary) = dictionary_encode(block, cardinality as u32, usize::MAX)
+                .expect("cardinality equal to the cap must encode");
+            assert_eq!(dictionary.num_values(), cardinality as u64);
+            assert!(dictionary_encode(block, cardinality as u32 - 1, usize::MAX).is_none());
+            assert!(dictionary_encode(block, 0, usize::MAX).is_none());
+        }
+    }
+
+    /// The default entry cap (100k) with every key distinct and repeated: the map
+    /// is sized for the full cap up front and the output still matches the
+    /// reference exactly.
+    #[test]
+    fn test_dictionary_encode_many_distinct_keys_at_default_cap() {
+        let distinct = 100_000usize;
+        let keys: Vec<Vec<u8>> = (0..distinct)
+            .map(|i| format!("key-{i:08}").into_bytes())
+            .collect();
+        let rows: Vec<Vec<u8>> = keys.iter().chain(keys.iter().rev()).cloned().collect();
+        let block = DataBlock::from_array(
+            Arc::new(BinaryArray::from_iter_values(rows.iter())) as Arc<dyn Array>
+        );
+        let (indices, dictionary) =
+            dictionary_encode(&block, distinct as u32, usize::MAX).expect("dictionary encoding");
+        assert_eq!(variable_dictionary_of(&dictionary), keys);
+        let expected_indices: Vec<i32> = (0..distinct as i32)
+            .chain((0..distinct as i32).rev())
+            .collect();
+        assert_eq!(indices_of(&indices), expected_indices);
+        assert!(dictionary_encode(&block, distinct as u32 - 1, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn test_dictionary_encode_is_deterministic() {
+        let rows = rows_from(&tricky_string_keys(), 3_000);
+        let block = DataBlock::from_array(Arc::new(StringArray::from(rows)) as Arc<dyn Array>);
+        let first = dictionary_encode(&block, u32::MAX, usize::MAX).unwrap();
+        let second = dictionary_encode(&block, u32::MAX, usize::MAX).unwrap();
+        assert_eq!(indices_of(&first.0), indices_of(&second.0));
+        assert_eq!(
+            variable_dictionary_of(&first.1),
+            variable_dictionary_of(&second.1)
+        );
+    }
+
+    #[test]
+    fn test_dictionary_map_capacity_is_bounded_by_both_limits() {
+        assert_eq!(dictionary_map_capacity(10, 0), 0);
+        assert_eq!(dictionary_map_capacity(10, 5), 5);
+        assert_eq!(dictionary_map_capacity(5, 10), 5);
+        assert_eq!(dictionary_map_capacity(0, 10), 0);
+        assert_eq!(
+            dictionary_map_capacity(u64::MAX, u32::MAX),
+            u32::MAX as usize
+        );
+    }
+
+    /// The hasher is stable within a process (so lookups agree with inserts) and
+    /// is not the unseeded default, whose outputs anyone can precompute.
+    #[test]
+    fn test_dictionary_hasher_is_stable_and_seeded() {
+        let keys: Vec<Vec<u8>> = (0..16u8).map(|i| vec![i; i as usize + 1]).collect();
+        for key in &keys {
+            assert_eq!(
+                dictionary_hasher().hash_one(key),
+                dictionary_hasher().hash_one(key)
+            );
+        }
+        let unseeded = Xxh3Builder::new();
+        assert!(
+            keys.iter()
+                .any(|key| dictionary_hasher().hash_one(key) != unseeded.hash_one(key)),
+            "dictionary hasher must not equal the fixed-seed xxh3 hasher"
+        );
     }
 }
