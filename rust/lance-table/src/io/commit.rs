@@ -1748,6 +1748,11 @@ impl Debug for ConditionalPutCommitHandler {
 pub struct CommitConfig {
     pub num_retries: u32,
     pub skip_auto_cleanup: bool,
+    /// Transaction property holding this commit's idempotency keys (a JSON
+    /// array of strings). When set, a transaction committed after the read
+    /// version that carries any of the same keys fails the commit instead of
+    /// being rebased over.
+    pub idempotency_property: Option<String>,
     // TODO: add isolation_level
 }
 
@@ -1756,6 +1761,7 @@ impl Default for CommitConfig {
         Self {
             num_retries: 20,
             skip_auto_cleanup: false,
+            idempotency_property: None,
         }
     }
 }

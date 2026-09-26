@@ -4518,6 +4518,7 @@ class LanceDataset(pa.dataset.Dataset):
         namespace_client_managed_versioning: bool = False,
         base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
         commit_timeout: Optional[timedelta] = _DEFAULT_COMMIT_TIMEOUT,
+        idempotency_property: Optional[str] = None,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -4594,6 +4595,13 @@ class LanceDataset(pa.dataset.Dataset):
             Maximum time to wait for the commit operation (including retries on
             conflict) to complete. Defaults to 30 minutes. Pass ``None`` to
             disable the timeout entirely. Must be a positive duration.
+        idempotency_property : str, optional
+            Name of a transaction property that holds this commit's idempotency
+            keys as a JSON array of strings. When set, every transaction
+            committed after the read version is checked for the same keys, and
+            an overlap raises :class:`lance.commit.DuplicateTransactionError`
+            instead of rebasing over it. The property must be set on this
+            commit's transaction.
 
         Returns
         -------
@@ -4674,6 +4682,7 @@ class LanceDataset(pa.dataset.Dataset):
                 table_id=table_id,
                 namespace_client_managed_versioning=namespace_client_managed_versioning,
                 commit_timeout=commit_timeout,
+                idempotency_property=idempotency_property,
             )
         elif isinstance(operation, LanceOperation.BaseOperation):
             new_ds = _Dataset.commit(
@@ -4691,6 +4700,7 @@ class LanceDataset(pa.dataset.Dataset):
                 table_id=table_id,
                 namespace_client_managed_versioning=namespace_client_managed_versioning,
                 commit_timeout=commit_timeout,
+                idempotency_property=idempotency_property,
             )
         else:
             raise TypeError(

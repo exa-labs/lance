@@ -128,7 +128,28 @@ impl<T> PythonErrorExt<T> for std::result::Result<T, LanceError> {
     fn io_or_timeout_error(self) -> PyResult<T> {
         match &self {
             Err(LanceError::Timeout { .. }) => self.timeout_error(),
+            Err(err @ LanceError::DuplicateTransaction { version, keys, .. }) => {
+                Err(Python::attach(|py| {
+                    duplicate_transaction_to_pyerr(py, err.to_string(), *version, keys)
+                }))
+            }
             _ => self.io_error(),
         }
     }
+}
+
+/// Build `lance.commit.DuplicateTransactionError` (an `OSError`) carrying the
+/// conflicting version and the overlapping keys, so callers can decide
+/// whether the version is their own ambiguous commit or another writer's.
+fn duplicate_transaction_to_pyerr(
+    py: Python<'_>,
+    message: String,
+    version: u64,
+    keys: &[String],
+) -> PyErr {
+    PyModule::import(py, "lance.commit")
+        .and_then(|module| module.getattr("DuplicateTransactionError"))
+        .and_then(|class| class.call1((message, version, keys.to_vec())))
+        .map(|exc| PyErr::from_value(exc.into_bound()))
+        .unwrap_or_else(|err| err)
 }

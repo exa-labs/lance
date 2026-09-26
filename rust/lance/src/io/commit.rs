@@ -71,6 +71,7 @@ pub mod conflict_resolver;
 mod dynamodb;
 #[cfg(test)]
 mod external_manifest;
+mod idempotency;
 pub mod namespace_manifest;
 #[cfg(all(feature = "dynamodb_tests", test))]
 mod s3_test;
@@ -943,6 +944,11 @@ pub(crate) async fn commit_transaction(
         };
 
     let mut transaction = transaction.clone();
+    let idempotency_keys = commit_config
+        .idempotency_property
+        .as_deref()
+        .map(|property| idempotency::IdempotencyKeys::from_transaction(property, &transaction))
+        .transpose()?;
 
     let num_attempts = std::cmp::max(commit_config.num_retries, 1);
     let mut backoff = SlotBackoff::default();
@@ -975,6 +981,9 @@ pub(crate) async fn commit_transaction(
                 TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
 
             for (other_version, other_transaction) in other_transactions.iter() {
+                if let Some(keys) = &idempotency_keys {
+                    keys.check(other_transaction, *other_version)?;
+                }
                 rebase.check_txn(other_transaction, *other_version)?;
             }
 
