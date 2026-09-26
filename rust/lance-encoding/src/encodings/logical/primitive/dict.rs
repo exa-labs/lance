@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    hash::BuildHasher,
+    sync::{Arc, OnceLock},
+};
 
 /// Bits per value for FixedWidth dictionary values (legacy default for 128-bit values)
 pub const DICT_FIXED_WIDTH_BITS_PER_VALUE: u64 = 128;
@@ -20,6 +24,7 @@ use arrow_buffer::ArrowNativeType;
 use arrow_schema::DataType;
 use arrow_select::take::TakeOptions;
 use lance_core::{Error, Result, error::LanceOptionExt, utils::hash::U8SliceKey};
+use xxhash_rust::xxh3::Xxh3Builder;
 
 use crate::{
     buffer::LanceBuffer,
@@ -110,6 +115,27 @@ pub fn normalize_dict_nulls(array: Arc<dyn Array>) -> Result<Arc<dyn Array>> {
     }
 }
 
+/// Hasher for the dictionary-building maps: xxh3 (fast on short keys) with a
+/// per-process random seed. Dictionary keys are column values, which may be
+/// externally supplied, so a fixed seed would let crafted inputs collide into
+/// one bucket chain; the seed keeps probing cost unpredictable without SipHash.
+/// Output does not depend on the hasher: dictionary order is first occurrence.
+fn dictionary_hasher() -> Xxh3Builder {
+    static HASHER: OnceLock<Xxh3Builder> = OnceLock::new();
+    *HASHER.get_or_init(|| {
+        let seed =
+            std::collections::hash_map::RandomState::new().hash_one(0x6c61_6e63_655f_6469_u64);
+        Xxh3Builder::new().with_seed(seed)
+    })
+}
+
+/// Initial capacity for a dictionary-encoding hash map: one slot per distinct
+/// value it may hold, so it never rehashes while building. Growth-driven
+/// rehashing dominated the dictionary encoder's CPU on high-cardinality pages.
+fn dictionary_map_capacity(num_values: u64, max_dict_entries: u32) -> usize {
+    num_values.min(u64::from(max_dict_entries)) as usize
+}
+
 fn dict_encode_variable_width<T>(
     variable_width_data_block: &VariableWidthBlock,
     bits_per_offset: u8,
@@ -121,7 +147,10 @@ where
     usize: TryFrom<T>,
 {
     use std::collections::hash_map::Entry;
-    let mut map = HashMap::new();
+    let mut map = HashMap::with_capacity_and_hasher(
+        dictionary_map_capacity(variable_width_data_block.num_values, max_dict_entries),
+        dictionary_hasher(),
+    );
     let offsets = variable_width_data_block
         .offsets
         .borrow_to_typed_slice::<T>();
@@ -233,7 +262,13 @@ pub fn dictionary_encode(
 
             match fixed_width_data_block.bits_per_value {
                 64 => {
-                    let mut map = HashMap::new();
+                    let mut map = HashMap::with_capacity_and_hasher(
+                        dictionary_map_capacity(
+                            fixed_width_data_block.num_values,
+                            max_dict_entries,
+                        ),
+                        dictionary_hasher(),
+                    );
                     let u64_slice = fixed_width_data_block.data.borrow_to_typed_slice::<u64>();
                     let u64_slice = u64_slice.as_ref();
                     let mut dictionary_buffer =
@@ -289,7 +324,13 @@ pub fn dictionary_encode(
                 }
                 128 => {
                     // TODO: a follow up PR to support `FixedWidth DataBlock with bits_per_value == 256`.
-                    let mut map = HashMap::new();
+                    let mut map = HashMap::with_capacity_and_hasher(
+                        dictionary_map_capacity(
+                            fixed_width_data_block.num_values,
+                            max_dict_entries,
+                        ),
+                        dictionary_hasher(),
+                    );
                     let u128_slice = fixed_width_data_block.data.borrow_to_typed_slice::<u128>();
                     let u128_slice = u128_slice.as_ref();
                     let mut dictionary_buffer =
