@@ -1926,7 +1926,7 @@ mod tests {
         };
         let fragments = vec![
             make_fragment(0, vec![shared_a.clone(), shared_b.clone()]),
-            make_fragment(1, vec![shared_a.clone(), shared_b.clone()]),
+            make_fragment(1, vec![shared_a.clone(), shared_b]),
             make_fragment(
                 2,
                 vec![
