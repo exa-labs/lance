@@ -408,6 +408,16 @@ fn check_column_indices(manifest: &Manifest) -> Result<()> {
         return Ok(());
     }
 
+    let mut fields_by_id: HashMap<i32, (&lance_core::datatypes::Field, bool)> = HashMap::new();
+    for field in manifest.schema.fields_pre_order() {
+        let needs_column = field.is_leaf() || field.is_packed_struct() || field.is_blob();
+        fields_by_id
+            .entry(field.id)
+            .or_insert((field, needs_column));
+    }
+
+    let mut validated_lists: HashSet<(usize, usize)> = HashSet::new();
+
     for fragment in manifest.fragments.iter() {
         for data_file in &fragment.files {
             if data_file.is_legacy_file() || data_file.column_indices.is_empty() {
@@ -430,15 +440,21 @@ fn check_column_indices(manifest: &Manifest) -> Result<()> {
             if file_version < LanceFileVersion::V2_1 {
                 continue;
             }
+            let list_key = (
+                data_file.fields.as_ptr() as usize,
+                data_file.column_indices.as_ptr() as usize,
+            );
+            if !validated_lists.insert(list_key) {
+                continue;
+            }
             for (field_id, column_index) in
                 data_file.fields.iter().zip(data_file.column_indices.iter())
             {
                 // Field ids may not exist in the current schema after schema
                 // evolution (e.g. cast/drop column). Skip those.
-                let Some(field) = manifest.schema.field_by_id(*field_id) else {
+                let Some((field, needs_column)) = fields_by_id.get(field_id).copied() else {
                     continue;
                 };
-                let needs_column = field.is_leaf() || field.is_packed_struct() || field.is_blob();
                 if needs_column && *column_index == -1 {
                     return Err(Error::invalid_input(format!(
                         "Field '{}' (id={}) in data file '{}' (fragment {}) \
@@ -2057,5 +2073,49 @@ mod tests {
         );
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("must have a valid column index"), "{msg}");
+    }
+
+    #[test]
+    fn test_check_column_indices_rejects_after_dedup() {
+        let mut struct_field = Field::try_from(ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+            false,
+        ))
+        .unwrap();
+        struct_field.set_id(-1, &mut 0);
+
+        let schema = Schema {
+            fields: vec![struct_field],
+            metadata: Default::default(),
+        };
+
+        // struct=-1, leaf=0: valid layout; clones share the same Arcs.
+        let shared_file = DataFile::new("shared.lance", vec![0, 1], vec![-1, 0], 2, 1, None, None);
+        // Wrongly gives the struct a real column index.
+        let bad_file = DataFile::new("bad.lance", vec![0, 1], vec![0, 1], 2, 1, None, None);
+        let make_fragment = |id: u64, file: DataFile| Fragment {
+            id,
+            files: vec![file],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(100),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![
+                make_fragment(0, shared_file.clone()),
+                make_fragment(1, shared_file),
+                make_fragment(2, bad_file),
+            ]),
+            DataStorageFormat::new(LanceFileVersion::V2_1),
+            HashMap::new(),
+        );
+        let msg = check_column_indices(&manifest).unwrap_err().to_string();
+        assert!(msg.contains("Non-leaf field"), "{msg}");
+        assert!(msg.contains("bad.lance"), "{msg}");
     }
 }
