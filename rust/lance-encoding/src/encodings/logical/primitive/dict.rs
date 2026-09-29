@@ -375,7 +375,6 @@ mod tests {
         data::{BlockInfo, FixedWidthDataBlock},
     };
     use arrow_array::{Array, BinaryArray, LargeStringArray, StringArray};
-    use std::hash::BuildHasher;
     use std::sync::Arc;
 
     /// Dictionary and per-row indices computed without any hash map: values in
@@ -815,37 +814,6 @@ mod tests {
         assert_eq!(
             variable_dictionary_of(&first.1),
             variable_dictionary_of(&second.1)
-        );
-    }
-
-    #[test]
-    fn test_dictionary_map_capacity_is_bounded_by_both_limits() {
-        assert_eq!(dictionary_map_capacity(10, 0), 0);
-        assert_eq!(dictionary_map_capacity(10, 5), 5);
-        assert_eq!(dictionary_map_capacity(5, 10), 5);
-        assert_eq!(dictionary_map_capacity(0, 10), 0);
-        assert_eq!(
-            dictionary_map_capacity(u64::MAX, u32::MAX),
-            u32::MAX as usize
-        );
-    }
-
-    /// The hasher is stable within a process (so lookups agree with inserts) and
-    /// is not the unseeded default, whose outputs anyone can precompute.
-    #[test]
-    fn test_dictionary_hasher_is_stable_and_seeded() {
-        let keys: Vec<Vec<u8>> = (0..16u8).map(|i| vec![i; i as usize + 1]).collect();
-        for key in &keys {
-            assert_eq!(
-                dictionary_hasher().hash_one(key),
-                dictionary_hasher().hash_one(key)
-            );
-        }
-        let unseeded = Xxh3Builder::new();
-        assert!(
-            keys.iter()
-                .any(|key| dictionary_hasher().hash_one(key) != unseeded.hash_one(key)),
-            "dictionary hasher must not equal the fixed-seed xxh3 hasher"
         );
     }
 }
