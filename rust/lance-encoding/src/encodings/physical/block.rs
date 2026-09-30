@@ -26,6 +26,8 @@ use lance_core::{Error, Result};
 
 use std::str::FromStr;
 
+mod parallel;
+
 use crate::compression::{BlockCompressor, BlockDecompressor};
 use crate::encodings::physical::binary::{BinaryBlockDecompressor, VariableEncoder};
 use crate::format::{
@@ -518,6 +520,12 @@ impl CompressedBufferEncoder {
         offsets: &[T],
         compressed: &mut Vec<u8>,
     ) -> Result<LanceBuffer> {
+        if let Some(offsets) =
+            parallel::try_compress(data, offsets, compressed, self.compressor.config())?
+        {
+            return Ok(LanceBuffer::reinterpret_vec(offsets));
+        }
+
         let mut new_offsets: Vec<T> = Vec::with_capacity(offsets.len());
         new_offsets.push(T::from_usize(0).unwrap());
 
