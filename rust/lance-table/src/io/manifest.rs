@@ -315,6 +315,11 @@ fn append_fragments(
     ranges: &mut Vec<Option<Range<usize>>>,
 ) -> Result<()> {
     for (i, fragment) in fragments.iter().enumerate() {
+        // Checked before encoding: sizes only ever go from unknown to known,
+        // so a fragment whose sizes are all known here is encoded with them.
+        // Checking afterwards could cache bytes that missed a size filled in
+        // by a concurrent reader.
+        let reusable = !has_unknown_file_size(fragment);
         buf.push(MANIFEST_FRAGMENTS_KEY);
         let range = match cached.and_then(|cached| cached[i].as_ref()) {
             Some(bytes) => {
@@ -330,7 +335,7 @@ fn append_fragments(
                 buf.len() - len..buf.len()
             }
         };
-        ranges.push((!has_unknown_file_size(fragment)).then_some(range));
+        ranges.push(reusable.then_some(range));
     }
     Ok(())
 }
