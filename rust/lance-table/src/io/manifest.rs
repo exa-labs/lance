@@ -336,6 +336,9 @@ fn append_fragments(
 }
 
 /// Keep the encoded fragments written in `buf` on `manifest` for the next write.
+///
+/// The cached slices keep all of `buf` alive, so `buf` should hold the
+/// manifest message and nothing else.
 fn cache_encoded_fragments(
     manifest: &mut Manifest,
     buf: &Bytes,
@@ -345,7 +348,7 @@ fn cache_encoded_fragments(
         .into_iter()
         .map(|range| range.map(|range| buf.slice(range)))
         .collect();
-    manifest.set_encoded_fragments(encoded);
+    manifest.set_encoded_fragments(encoded, buf.len());
 }
 
 /// Write the manifest message and return its position.
@@ -379,25 +382,37 @@ pub async fn write_manifest(
     do_write_manifest(writer, manifest, indices, transaction).await
 }
 
-/// Serialize a complete manifest file into one buffer: the bytes
-/// [`write_manifest`] followed by `write_magics` produce, for commit handlers
-/// that upload the finished file in one request.
-pub async fn write_manifest_file_to_buffer(
+/// Serialize a complete manifest file in memory, for commit handlers that
+/// upload the finished file in one request. The returned chunks, concatenated,
+/// are the bytes [`write_manifest`] followed by `write_magics` produce.
+///
+/// The manifest message is a chunk of its own: the encoded fragments cached on
+/// `manifest` are slices of it, and must not keep the index and transaction
+/// sections alive.
+pub async fn write_manifest_file_to_chunks(
     manifest: &mut Manifest,
     indices: Option<Vec<IndexMetadata>>,
     transaction: Option<Transaction>,
-) -> Result<Bytes> {
-    let mut writer = BufferWriter::default();
-    write_dictionaries(&mut writer, manifest).await?;
-    write_index_and_transaction(&mut writer, manifest, indices, transaction).await?;
-    let pos = writer.buf.len();
-    let ranges = encode_manifest_message(manifest, &mut writer.buf)?;
-    writer
+) -> Result<Vec<Bytes>> {
+    let mut sections = BufferWriter::default();
+    write_dictionaries(&mut sections, manifest).await?;
+    write_index_and_transaction(&mut sections, manifest, indices, transaction).await?;
+    let pos = sections.buf.len();
+
+    let mut message = Vec::new();
+    let ranges = encode_manifest_message(manifest, &mut message)?;
+    let message = Bytes::from(message);
+    cache_encoded_fragments(manifest, &message, ranges);
+
+    let mut trailer = BufferWriter::default();
+    trailer
         .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
         .await?;
-    let buf = Bytes::from(writer.buf);
-    cache_encoded_fragments(manifest, &buf, ranges);
-    Ok(buf)
+    Ok(vec![
+        Bytes::from(sections.buf),
+        message,
+        Bytes::from(trailer.buf),
+    ])
 }
 
 /// A [`Writer`] that appends to an in-memory buffer.
@@ -701,7 +716,7 @@ mod test {
             .enumerate()
             .map(|(i, bytes)| bytes.clone().filter(|_| i % 4 != 0))
             .collect();
-        manifest.set_encoded_fragments(partial);
+        manifest.set_encoded_fragments(partial, expected.len());
         assert_eq!(encode_message(&mut manifest), expected);
 
         // No fragments.
@@ -764,7 +779,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_write_manifest_file_to_buffer_matches_object_writer() {
+    async fn test_write_manifest_file_to_chunks_matches_object_writer() {
         let store = ObjectStore::memory();
         for indices in [None, Some(vec![])] {
             let path = Path::from("manifest");
@@ -781,12 +796,20 @@ mod test {
             let expected = store.read_one_all(&path).await.unwrap();
 
             let mut buffered = manifest_with_fragments(50);
-            let file = write_manifest_file_to_buffer(&mut buffered, indices, None)
+            let chunks = write_manifest_file_to_chunks(&mut buffered, indices, None)
                 .await
                 .unwrap();
-            assert_eq!(file, expected);
+            assert_eq!(chunks.concat(), expected);
             assert_eq!(buffered, written);
-            assert!(buffered.encoded_fragments().is_some());
+
+            // The cached fragments are slices of the message chunk alone, so
+            // they do not keep the index and transaction sections alive.
+            let message = chunks[1].as_ptr_range();
+            let cached = buffered.encoded_fragments().unwrap();
+            for bytes in cached.iter().flatten() {
+                let slice = bytes.as_ptr_range();
+                assert!(message.start <= slice.start && slice.end <= message.end);
+            }
 
             let read_back = read_manifest(&store, &path, None).await.unwrap();
             assert_eq!(read_back, buffered);

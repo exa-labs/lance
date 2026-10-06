@@ -7033,9 +7033,10 @@ mod tests {
     async fn write_and_decode_manifest(manifest: &mut Manifest) -> pb::Manifest {
         use prost::Message;
 
-        let file = lance_table::io::manifest::write_manifest_file_to_buffer(manifest, None, None)
+        let file = lance_table::io::manifest::write_manifest_file_to_chunks(manifest, None, None)
             .await
-            .unwrap();
+            .unwrap()
+            .concat();
         let footer = file.len() - 16;
         let pos = i64::from_le_bytes(file[footer..footer + 8].try_into().unwrap()) as usize;
         let len = u32::from_le_bytes(file[pos..pos + 4].try_into().unwrap()) as usize;

@@ -29,7 +29,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::{fmt::Debug, fs::DirEntry};
 
-use super::manifest::{write_manifest, write_manifest_file_to_buffer};
+use super::manifest::{write_manifest, write_manifest_file_to_chunks};
 use bytes::Bytes;
 use futures::Stream;
 use futures::future::Either;
@@ -45,7 +45,7 @@ use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::PutOptions;
 use object_store::{
     Error as ObjectStoreError, MultipartUpload, ObjectStore as OSObjectStore, PutMode,
-    PutMultipartOptions, PutResult, path::Path,
+    PutMultipartOptions, PutPayload, PutResult, path::Path,
 };
 use tracing::info;
 use url::Url;
@@ -239,7 +239,7 @@ pub fn write_manifest_file_to_path<'a>(
 }
 
 /// Whether `writer` is [`write_manifest_file_to_path`], whose file a commit
-/// handler can serialize in memory with [`write_manifest_file_to_buffer`].
+/// handler can serialize in memory with [`write_manifest_file_to_chunks`].
 ///
 /// The same function can have more than one address (one per codegen unit
 /// that instantiates it); a false negative only means the handler takes its
@@ -1600,8 +1600,8 @@ enum MultipartCommitOutcome {
     Unsupported,
 }
 
-/// Write `data` to `path` via a conditional (`PutMode::Create`) multipart
-/// upload, if the backend supports it.
+/// Write the concatenation of `chunks` to `path` via a conditional
+/// (`PutMode::Create`) multipart upload, if the backend supports it.
 ///
 /// This never falls back internally: `Unsupported` is returned so the caller
 /// can retry with a single PUT using the same conflict-mapping semantics as
@@ -1609,7 +1609,7 @@ enum MultipartCommitOutcome {
 async fn try_conditional_multipart_put(
     object_store: &ObjectStore,
     path: &Path,
-    data: &Bytes,
+    chunks: &[Bytes],
 ) -> std::result::Result<MultipartCommitOutcome, CommitError> {
     let mut upload = match object_store
         .inner
@@ -1631,25 +1631,18 @@ async fn try_conditional_multipart_put(
         Err(err) => return Err(CommitError::OtherError(err.into())),
     };
 
-    let part_size = manifest_multipart_part_size(data.len());
-    let mut parts = Vec::with_capacity(data.len().div_ceil(part_size));
-    let mut offset = 0usize;
-    while offset < data.len() {
-        let end = (offset + part_size).min(data.len());
-        parts.push(data.slice(offset..end));
-        offset = end;
-    }
+    let total_len = chunks.iter().map(Bytes::len).sum();
+    let parts = split_into_parts(chunks, manifest_multipart_part_size(total_len));
 
     // Bound concurrency the same way `ObjectWriter`'s data-file multipart
     // path does (`max_upload_parallelism()` / `LANCE_UPLOAD_CONCURRENCY`,
     // default 10) -- nothing below us (object_store, or the underlying HTTP
     // client) imposes an in-flight-request cap on its own, so without this
     // an oversized manifest would fire off every part PUT at once.
-    let upload_result =
-        futures::stream::iter(parts.into_iter().map(|part| upload.put_part(part.into())))
-            .buffer_unordered(max_upload_parallelism())
-            .try_for_each(|_| future::ready(Ok(())))
-            .await;
+    let upload_result = futures::stream::iter(parts.into_iter().map(|part| upload.put_part(part)))
+        .buffer_unordered(max_upload_parallelism())
+        .try_for_each(|_| future::ready(Ok(())))
+        .await;
 
     if let Err(err) = upload_result {
         // A part failed, so we never reach `complete`. The object_store
@@ -1672,17 +1665,43 @@ async fn try_conditional_multipart_put(
     }
 }
 
-/// Write `data` to `path` with a single conditional (`PutMode::Create`) PUT.
+/// Split the concatenation of `chunks` into consecutive payloads of
+/// `part_size` bytes (the last one may be shorter) without copying.
+fn split_into_parts(chunks: &[Bytes], part_size: usize) -> Vec<PutPayload> {
+    let mut parts = Vec::new();
+    let mut part = Vec::new();
+    let mut part_len = 0;
+    for chunk in chunks {
+        let mut offset = 0;
+        while offset < chunk.len() {
+            let take = (part_size - part_len).min(chunk.len() - offset);
+            part.push(chunk.slice(offset..offset + take));
+            part_len += take;
+            offset += take;
+            if part_len == part_size {
+                parts.push(PutPayload::from_iter(std::mem::take(&mut part)));
+                part_len = 0;
+            }
+        }
+    }
+    if part_len > 0 {
+        parts.push(PutPayload::from_iter(part));
+    }
+    parts
+}
+
+/// Write the concatenation of `chunks` to `path` with a single conditional
+/// (`PutMode::Create`) PUT.
 async fn single_conditional_put(
     object_store: &ObjectStore,
     path: &Path,
-    data: Bytes,
+    chunks: &[Bytes],
 ) -> std::result::Result<PutResult, CommitError> {
     object_store
         .inner
         .put_opts(
             path,
-            data.into(),
+            PutPayload::from_iter(chunks.iter().cloned()),
             PutOptions {
                 mode: PutMode::Create,
                 ..Default::default()
@@ -1714,8 +1733,8 @@ impl CommitHandler for ConditionalPutCommitHandler {
         let path = naming_scheme.manifest_path(base_path, manifest.version);
 
         let canonical = is_canonical_manifest_writer(manifest_writer);
-        let data = if canonical {
-            write_manifest_file_to_buffer(manifest, indices, transaction).await?
+        let chunks = if canonical {
+            write_manifest_file_to_chunks(manifest, indices, transaction).await?
         } else {
             let memory_store = ObjectStore::memory();
             let dummy_path = "dummy";
@@ -1727,22 +1746,22 @@ impl CommitHandler for ConditionalPutCommitHandler {
                 transaction,
             )
             .await?;
-            memory_store.read_one_all(&dummy_path.into()).await?
+            vec![memory_store.read_one_all(&dummy_path.into()).await?]
         };
-        let size = data.len() as u64;
+        let size: usize = chunks.iter().map(Bytes::len).sum();
 
-        let res = if data.len() > manifest_multipart_threshold() {
-            match try_conditional_multipart_put(object_store, &path, &data).await? {
+        let res = if size > manifest_multipart_threshold() {
+            match try_conditional_multipart_put(object_store, &path, &chunks).await? {
                 MultipartCommitOutcome::Completed(res) => res,
                 // The store can't do a conditional multipart complete (e.g.
                 // GCS). Fall back to the single-PUT path so we never
                 // silently lose atomicity.
                 MultipartCommitOutcome::Unsupported => {
-                    single_conditional_put(object_store, &path, data).await?
+                    single_conditional_put(object_store, &path, &chunks).await?
                 }
             }
         } else {
-            single_conditional_put(object_store, &path, data).await?
+            single_conditional_put(object_store, &path, &chunks).await?
         };
         if canonical {
             info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string());
@@ -1753,7 +1772,7 @@ impl CommitHandler for ConditionalPutCommitHandler {
         Ok(ManifestLocation {
             version: manifest.version,
             path,
-            size: Some(size),
+            size: Some(size as u64),
             naming_scheme,
             e_tag: res.e_tag,
         })
@@ -2746,6 +2765,35 @@ mod tests {
         let bytes = object_store.read_one_all(&location.path).await.unwrap();
         assert_eq!(bytes.len(), LARGE_MULTIPART_MANIFEST_PAYLOAD_LEN);
         assert!(bytes.iter().all(|&b| b == 7));
+    }
+
+    #[test]
+    fn test_split_into_parts_crosses_chunk_boundaries() {
+        let chunks = vec![
+            Bytes::from_static(b"abc"),
+            Bytes::from_static(b"defghijklm"),
+            Bytes::new(),
+            Bytes::from_static(b"nopq"),
+        ];
+        let parts = split_into_parts(&chunks, 5);
+        let parts: Vec<Vec<u8>> = parts
+            .into_iter()
+            .map(|part| part.into_iter().flatten().collect())
+            .collect();
+        assert_eq!(
+            parts,
+            vec![
+                b"abcde".to_vec(),
+                b"fghij".to_vec(),
+                b"klmno".to_vec(),
+                b"pq".to_vec()
+            ]
+        );
+        assert!(split_into_parts(&[Bytes::new()], 5).is_empty());
+        assert_eq!(
+            split_into_parts(&[Bytes::from_static(b"abcde")], 5).len(),
+            1
+        );
     }
 
     #[test]

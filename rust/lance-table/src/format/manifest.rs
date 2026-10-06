@@ -308,9 +308,15 @@ impl Manifest {
         self.encoded_fragments.get(&self.fragments)
     }
 
-    /// Record `encoded[i]` as the encoded bytes of `fragments[i]`.
-    pub(crate) fn set_encoded_fragments(&mut self, encoded: Vec<Option<Bytes>>) {
-        self.encoded_fragments = EncodedFragmentCache::new(&self.fragments, encoded);
+    /// Record `encoded[i]` as the encoded bytes of `fragments[i]`; the entries
+    /// are slices of one buffer of `retained_bytes` bytes.
+    pub(crate) fn set_encoded_fragments(
+        &mut self,
+        encoded: Vec<Option<Bytes>>,
+        retained_bytes: usize,
+    ) {
+        self.encoded_fragments =
+            EncodedFragmentCache::new(&self.fragments, encoded, retained_bytes);
     }
 
     /// Reuse `previous`'s encoded bytes for every fragment of this manifest
@@ -329,7 +335,7 @@ impl Manifest {
             &self.fragments,
             changed_ids,
         );
-        self.set_encoded_fragments(encoded);
+        self.set_encoded_fragments(encoded, previous.encoded_fragments.retained_bytes());
     }
 
     /// Return the `timestamp_nanos` value as a Utc DateTime

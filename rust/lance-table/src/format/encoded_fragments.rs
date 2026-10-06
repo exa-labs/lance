@@ -36,13 +36,21 @@ struct EncodedFragments {
     /// The fragment list `encoded` describes, by identity.
     fragments: Weak<Vec<Fragment>>,
     encoded: Arc<Vec<Option<Bytes>>>,
+    /// Size of the buffer the entries of `encoded` slice, which they keep
+    /// alive whole.
+    retained_bytes: usize,
 }
 
 impl EncodedFragmentCache {
-    /// A cache for `fragments` holding `encoded[i]` for `fragments[i]`.
+    /// A cache for `fragments` holding `encoded[i]` for `fragments[i]`, where
+    /// the entries are slices of one buffer of `retained_bytes` bytes.
     ///
     /// Returns an empty cache when the lengths differ or no entry is present.
-    pub fn new(fragments: &Arc<Vec<Fragment>>, encoded: Vec<Option<Bytes>>) -> Self {
+    pub fn new(
+        fragments: &Arc<Vec<Fragment>>,
+        encoded: Vec<Option<Bytes>>,
+        retained_bytes: usize,
+    ) -> Self {
         if encoded.len() != fragments.len() || encoded.iter().all(Option::is_none) {
             return Self::default();
         }
@@ -50,8 +58,14 @@ impl EncodedFragmentCache {
             inner: Some(EncodedFragments {
                 fragments: Arc::downgrade(fragments),
                 encoded: Arc::new(encoded),
+                retained_bytes,
             }),
         }
+    }
+
+    /// Size of the buffer the cached entries keep alive.
+    pub fn retained_bytes(&self) -> usize {
+        self.inner.as_ref().map_or(0, |inner| inner.retained_bytes)
     }
 
     /// The encoded fragments, if this cache describes exactly `fragments`.
@@ -133,15 +147,11 @@ impl PartialEq for EncodedFragmentCache {
 }
 
 impl DeepSizeOf for EncodedFragmentCache {
+    /// The entry list plus the whole buffer the entries keep alive, not just
+    /// the bytes they cover.
     fn deep_size_of_children(&self, _context: &mut Context) -> usize {
         self.inner.as_ref().map_or(0, |inner| {
-            inner.encoded.capacity() * std::mem::size_of::<Option<Bytes>>()
-                + inner
-                    .encoded
-                    .iter()
-                    .flatten()
-                    .map(Bytes::len)
-                    .sum::<usize>()
+            inner.encoded.capacity() * std::mem::size_of::<Option<Bytes>>() + inner.retained_bytes
         })
     }
 }
@@ -163,7 +173,7 @@ mod tests {
     #[test]
     fn test_cache_is_tied_to_one_fragment_list() {
         let list = Arc::new(fragments(&[1, 2]));
-        let cache = EncodedFragmentCache::new(&list, bytes_for(&[1, 2]));
+        let cache = EncodedFragmentCache::new(&list, bytes_for(&[1, 2]), 16);
         assert!(cache.get(&list).is_some());
 
         // A clone of the Arc is the same list.
@@ -186,14 +196,31 @@ mod tests {
     fn test_cache_rejects_mismatched_lengths_and_empty_entries() {
         let list = Arc::new(fragments(&[1, 2]));
         assert!(
-            EncodedFragmentCache::new(&list, bytes_for(&[1]))
+            EncodedFragmentCache::new(&list, bytes_for(&[1]), 8)
                 .get(&list)
                 .is_none()
         );
         assert!(
-            EncodedFragmentCache::new(&list, vec![None, None])
+            EncodedFragmentCache::new(&list, vec![None, None], 0)
                 .get(&list)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn test_cache_size_counts_the_retained_buffer() {
+        let list = Arc::new(fragments(&[1, 2]));
+        let buffer = Bytes::from(vec![0u8; 1000]);
+        let encoded = vec![Some(buffer.slice(0..10)), Some(buffer.slice(10..20))];
+        let cache = EncodedFragmentCache::new(&list, encoded, buffer.len());
+        assert_eq!(cache.retained_bytes(), 1000);
+        assert_eq!(
+            cache.deep_size_of_children(&mut Context::new()),
+            2 * std::mem::size_of::<Option<Bytes>>() + 1000
+        );
+        assert_eq!(
+            EncodedFragmentCache::default().deep_size_of_children(&mut Context::new()),
+            0
         );
     }
 
