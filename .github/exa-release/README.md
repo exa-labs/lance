@@ -22,27 +22,31 @@ and fetch the Cargo dependencies once first, so both builds only read
 `~/.rustup` and the `~/.cargo` registry and git caches. Give each build its
 own `EXA_WHEEL_TOOLCHAIN_DIR` so the Zig, maturin, and protoc archives are not
 downloaded and checksummed in one place by two processes. Wait on each build
-separately so that a failure in either one fails the step:
+separately so that a failure in either one fails the step. The subshell runs
+with `set -e`, so a failed warm-up stops before either build starts:
 
 ```shell
 git clone --branch <release-tag> https://github.com/exa-labs/lance.git /persistent/path/lance-release
 cd /persistent/path/lance-release
-rustup toolchain install 1.91.0 --profile minimal \
-  --target x86_64-unknown-linux-gnu --target aarch64-unknown-linux-gnu
-CARGO_NET_GIT_FETCH_WITH_CLI=true \
-  rustup run 1.91.0 cargo fetch --locked --manifest-path python/Cargo.toml
+(
+  set -euo pipefail
+  rustup toolchain install 1.91.0 --profile minimal \
+    --target x86_64-unknown-linux-gnu --target aarch64-unknown-linux-gnu
+  CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    rustup run 1.91.0 cargo fetch --locked --manifest-path python/Cargo.toml
 
-pids=()
-for arch in x86_64 aarch64; do
-  EXA_WHEEL_TOOLCHAIN_DIR="${HOME}/.cache/lance-exa-wheel-toolchain-${arch}" \
-    .github/exa-release/build-wheel.sh "${PWD}" "${arch}" "/persistent/path/exa-wheel-${arch}" &
-  pids+=("$!")
-done
-failed=0
-for pid in "${pids[@]}"; do
-  wait "${pid}" || failed=1
-done
-test "${failed}" = 0
+  pids=()
+  for arch in x86_64 aarch64; do
+    EXA_WHEEL_TOOLCHAIN_DIR="${HOME}/.cache/lance-exa-wheel-toolchain-${arch}" \
+      .github/exa-release/build-wheel.sh "${PWD}" "${arch}" "/persistent/path/exa-wheel-${arch}" &
+    pids+=("$!")
+  done
+  failed=0
+  for pid in "${pids[@]}"; do
+    wait "${pid}" || failed=1
+  done
+  test "${failed}" = 0
+)
 ```
 
 Each output directory then contains the wheel and `<wheel>.provenance.txt`,
