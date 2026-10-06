@@ -29,7 +29,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::{fmt::Debug, fs::DirEntry};
 
-use super::manifest::write_manifest;
+use super::manifest::{write_manifest, write_manifest_file_to_buffer};
 use bytes::Bytes;
 use futures::Stream;
 use futures::future::Either;
@@ -215,6 +215,10 @@ pub type ManifestWriter = for<'a> fn(
 /// Canonical manifest writer; its function item type exactly matches `ManifestWriter`.
 /// Rationale: keep a crate-local writer implementation so call sites can pass this function
 /// directly without non-primitive casts or lifetime coercions.
+///
+/// `inline(never)` keeps a single copy of this function across crates, so
+/// [`is_canonical_manifest_writer`] recognizes it by address.
+#[inline(never)]
 pub fn write_manifest_file_to_path<'a>(
     object_store: &'a ObjectStore,
     manifest: &'a mut Manifest,
@@ -232,6 +236,16 @@ pub fn write_manifest_file_to_path<'a>(
         info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string());
         Ok(res)
     })
+}
+
+/// Whether `writer` is [`write_manifest_file_to_path`], whose file a commit
+/// handler can serialize in memory with [`write_manifest_file_to_buffer`].
+///
+/// The same function can have more than one address (one per codegen unit
+/// that instantiates it); a false negative only means the handler takes its
+/// generic path.
+fn is_canonical_manifest_writer(writer: ManifestWriter) -> bool {
+    std::ptr::fn_addr_eq(writer, write_manifest_file_to_path as ManifestWriter)
 }
 
 #[derive(Debug, Clone)]
@@ -1699,32 +1713,40 @@ impl CommitHandler for ConditionalPutCommitHandler {
     ) -> std::result::Result<ManifestLocation, CommitError> {
         let path = naming_scheme.manifest_path(base_path, manifest.version);
 
-        let memory_store = ObjectStore::memory();
-        let dummy_path = "dummy";
-        manifest_writer(
-            &memory_store,
-            manifest,
-            indices,
-            &dummy_path.into(),
-            transaction,
-        )
-        .await?;
-        let dummy_data = memory_store.read_one_all(&dummy_path.into()).await?;
-        let size = dummy_data.len() as u64;
+        let canonical = is_canonical_manifest_writer(manifest_writer);
+        let data = if canonical {
+            write_manifest_file_to_buffer(manifest, indices, transaction).await?
+        } else {
+            let memory_store = ObjectStore::memory();
+            let dummy_path = "dummy";
+            manifest_writer(
+                &memory_store,
+                manifest,
+                indices,
+                &dummy_path.into(),
+                transaction,
+            )
+            .await?;
+            memory_store.read_one_all(&dummy_path.into()).await?
+        };
+        let size = data.len() as u64;
 
-        let res = if dummy_data.len() > manifest_multipart_threshold() {
-            match try_conditional_multipart_put(object_store, &path, &dummy_data).await? {
+        let res = if data.len() > manifest_multipart_threshold() {
+            match try_conditional_multipart_put(object_store, &path, &data).await? {
                 MultipartCommitOutcome::Completed(res) => res,
                 // The store can't do a conditional multipart complete (e.g.
                 // GCS). Fall back to the single-PUT path so we never
                 // silently lose atomicity.
                 MultipartCommitOutcome::Unsupported => {
-                    single_conditional_put(object_store, &path, dummy_data).await?
+                    single_conditional_put(object_store, &path, data).await?
                 }
             }
         } else {
-            single_conditional_put(object_store, &path, dummy_data).await?
+            single_conditional_put(object_store, &path, data).await?
         };
+        if canonical {
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string());
+        }
 
         write_version_hint(object_store, base_path, manifest.version).await;
 
@@ -2724,5 +2746,56 @@ mod tests {
         let bytes = object_store.read_one_all(&location.path).await.unwrap();
         assert_eq!(bytes.len(), LARGE_MULTIPART_MANIFEST_PAYLOAD_LEN);
         assert!(bytes.iter().all(|&b| b == 7));
+    }
+
+    #[test]
+    fn test_is_canonical_manifest_writer() {
+        assert!(is_canonical_manifest_writer(write_manifest_file_to_path));
+        assert!(!is_canonical_manifest_writer(fixed_size_manifest_writer));
+    }
+
+    /// With the canonical writer, the conditional-put handler serializes the
+    /// manifest file in memory; the uploaded file is the one
+    /// `write_manifest_file_to_path` writes and reads back as the manifest.
+    #[tokio::test]
+    async fn test_conditional_put_commit_writes_canonical_manifest_file() {
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("test");
+        let mut manifest = test_manifest();
+
+        let location = ConditionalPutCommitHandler
+            .commit(
+                &mut manifest,
+                Some(vec![]),
+                &base_path,
+                &object_store,
+                write_manifest_file_to_path,
+                ManifestNamingScheme::V2,
+                None,
+            )
+            .await
+            .unwrap();
+        let committed = object_store.read_one_all(&location.path).await.unwrap();
+        assert_eq!(location.size, Some(committed.len() as u64));
+
+        let mut expected_manifest = test_manifest();
+        let expected_path = Path::from("expected");
+        write_manifest_file_to_path(
+            &object_store,
+            &mut expected_manifest,
+            Some(vec![]),
+            &expected_path,
+            None,
+        )
+        .await
+        .unwrap();
+        let expected = object_store.read_one_all(&expected_path).await.unwrap();
+        assert_eq!(committed, expected);
+
+        let read_back =
+            super::super::manifest::read_manifest(&object_store, &location.path, location.size)
+                .await
+                .unwrap();
+        assert_eq!(read_back, manifest);
     }
 }

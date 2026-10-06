@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::prelude::*;
 use lance_core::deepsize::DeepSizeOf;
 use lance_file::datatypes::{Fields, FieldsWithMeta, populate_schema_dictionary};
@@ -16,6 +17,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::Fragment;
+use super::encoded_fragments::{EncodedFragmentCache, carry_encoded_fragments};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
@@ -101,6 +103,10 @@ pub struct Manifest {
 
     /* external base paths */
     pub base_paths: HashMap<u32, BasePath>,
+
+    /// Encoded bytes of `fragments`, reused when this manifest, or one derived
+    /// from it, is written. Ignored by equality.
+    encoded_fragments: EncodedFragmentCache,
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -196,6 +202,7 @@ impl Manifest {
             config: HashMap::new(),
             table_metadata: HashMap::new(),
             base_paths,
+            encoded_fragments: EncodedFragmentCache::default(),
         }
     }
 
@@ -227,6 +234,7 @@ impl Manifest {
             config: previous.config.clone(),
             table_metadata: previous.table_metadata.clone(),
             base_paths: previous.base_paths.clone(),
+            encoded_fragments: EncodedFragmentCache::default(),
         }
     }
 
@@ -289,7 +297,39 @@ impl Manifest {
                 base_paths
             },
             table_metadata: self.table_metadata.clone(),
+            encoded_fragments: EncodedFragmentCache::default(),
         }
+    }
+
+    /// Encoded `pb::DataFragment` bytes of `fragments`, by position, if the
+    /// cached encodings describe the current fragment list. A `None` entry is
+    /// a fragment that has to be encoded when the manifest is written.
+    pub fn encoded_fragments(&self) -> Option<&[Option<Bytes>]> {
+        self.encoded_fragments.get(&self.fragments)
+    }
+
+    /// Record `encoded[i]` as the encoded bytes of `fragments[i]`.
+    pub(crate) fn set_encoded_fragments(&mut self, encoded: Vec<Option<Bytes>>) {
+        self.encoded_fragments = EncodedFragmentCache::new(&self.fragments, encoded);
+    }
+
+    /// Reuse `previous`'s encoded bytes for every fragment of this manifest
+    /// that was taken unchanged from `previous`.
+    ///
+    /// `changed_ids` must hold the id of every fragment this manifest added,
+    /// replaced or modified relative to `previous`. Callers derive it from the
+    /// transaction's own bookkeeping; fragments are never compared by content.
+    pub fn reuse_encoded_fragments(&mut self, previous: &Self, changed_ids: &[u64]) {
+        let Some(previous_encoded) = previous.encoded_fragments() else {
+            return;
+        };
+        let encoded = carry_encoded_fragments(
+            &previous.fragments,
+            previous_encoded,
+            &self.fragments,
+            changed_ids,
+        );
+        self.set_encoded_fragments(encoded);
     }
 
     /// Return the `timestamp_nanos` value as a Utc DateTime
@@ -921,6 +961,7 @@ impl TryFrom<pb::Manifest> for Manifest {
                 Some(p.transaction_file)
             },
             transaction_section: p.transaction_section.map(|i| i as usize),
+            encoded_fragments: EncodedFragmentCache::default(),
             fragment_offsets,
             next_row_id: p.next_row_id,
             data_storage_format,
@@ -937,64 +978,73 @@ impl TryFrom<pb::Manifest> for Manifest {
 
 impl From<&Manifest> for pb::Manifest {
     fn from(m: &Manifest) -> Self {
-        let timestamp_nanos = if m.timestamp_nanos == 0 {
-            None
-        } else {
-            let nanos = m.timestamp_nanos % 1e9 as u128;
-            let seconds = ((m.timestamp_nanos - nanos) / 1e9 as u128) as i64;
-            Some(Timestamp {
-                seconds,
-                nanos: nanos as i32,
-            })
-        };
-        let fields_with_meta: FieldsWithMeta = (&m.schema).into();
         Self {
-            fields: fields_with_meta.fields.0,
-            schema_metadata: m
-                .schema
-                .metadata
-                .iter()
-                .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
-                .collect(),
-            version: m.version,
-            branch: m.branch.clone(),
-            writer_version: m
-                .writer_version
-                .as_ref()
-                .map(|wv| pb::manifest::WriterVersion {
-                    library: wv.library.clone(),
-                    version: wv.version.clone(),
-                    prerelease: wv.prerelease.clone(),
-                    build_metadata: wv.build_metadata.clone(),
-                }),
             fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
-            table_metadata: m.table_metadata.clone(),
-            version_aux_data: m.version_aux_data as u64,
-            index_section: m.index_section.map(|i| i as u64),
-            timestamp: timestamp_nanos,
-            tag: m.tag.clone().unwrap_or_default(),
-            reader_feature_flags: m.reader_feature_flags,
-            writer_feature_flags: m.writer_feature_flags,
-            max_fragment_id: m.max_fragment_id,
-            transaction_file: m.transaction_file.clone().unwrap_or_default(),
-            next_row_id: m.next_row_id,
-            data_format: Some(pb::manifest::DataStorageFormat {
-                file_format: m.data_storage_format.file_format.clone(),
-                version: m.data_storage_format.version.clone(),
-            }),
-            config: m.config.clone(),
-            base_paths: m
-                .base_paths
-                .values()
-                .map(|base_path| pb::BasePath {
-                    id: base_path.id,
-                    name: base_path.name.clone(),
-                    is_dataset_root: base_path.is_dataset_root,
-                    path: base_path.path.clone(),
-                })
-                .collect(),
-            transaction_section: m.transaction_section.map(|i| i as u64),
+            ..pb_manifest_without_fragments(m)
         }
+    }
+}
+
+/// The protobuf form of `m` with `fragments` left empty, for writers that
+/// encode the fragments themselves.
+pub fn pb_manifest_without_fragments(m: &Manifest) -> pb::Manifest {
+    let timestamp_nanos = if m.timestamp_nanos == 0 {
+        None
+    } else {
+        let nanos = m.timestamp_nanos % 1e9 as u128;
+        let seconds = ((m.timestamp_nanos - nanos) / 1e9 as u128) as i64;
+        Some(Timestamp {
+            seconds,
+            nanos: nanos as i32,
+        })
+    };
+    let fields_with_meta: FieldsWithMeta = (&m.schema).into();
+    pb::Manifest {
+        fields: fields_with_meta.fields.0,
+        schema_metadata: m
+            .schema
+            .metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
+            .collect(),
+        version: m.version,
+        branch: m.branch.clone(),
+        writer_version: m
+            .writer_version
+            .as_ref()
+            .map(|wv| pb::manifest::WriterVersion {
+                library: wv.library.clone(),
+                version: wv.version.clone(),
+                prerelease: wv.prerelease.clone(),
+                build_metadata: wv.build_metadata.clone(),
+            }),
+        fragments: vec![],
+        table_metadata: m.table_metadata.clone(),
+        version_aux_data: m.version_aux_data as u64,
+        index_section: m.index_section.map(|i| i as u64),
+        timestamp: timestamp_nanos,
+        tag: m.tag.clone().unwrap_or_default(),
+        reader_feature_flags: m.reader_feature_flags,
+        writer_feature_flags: m.writer_feature_flags,
+        max_fragment_id: m.max_fragment_id,
+        transaction_file: m.transaction_file.clone().unwrap_or_default(),
+        next_row_id: m.next_row_id,
+        data_format: Some(pb::manifest::DataStorageFormat {
+            file_format: m.data_storage_format.file_format.clone(),
+            version: m.data_storage_format.version.clone(),
+        }),
+        config: m.config.clone(),
+        base_paths: m
+            .base_paths
+            .values()
+            .map(|base_path| pb::BasePath {
+                id: base_path.id,
+                name: base_path.name.clone(),
+                is_dataset_root: base_path.is_dataset_root,
+                path: base_path.path.clone(),
+            })
+            .collect(),
+        transaction_section: m.transaction_section.map(|i| i as u64),
     }
 }
 
