@@ -4539,6 +4539,7 @@ dependencies = [
  "prost-types",
  "rand 0.9.5",
  "rangemap",
+ "rayon",
  "roaring",
  "semver",
  "serde",
@@ -6037,7 +6038,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "9.0.1+exa.14"
+version = "9.0.1+exa.15"
 dependencies = [
  "alloc-stdlib",
  "arrow",
