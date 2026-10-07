@@ -916,6 +916,20 @@ pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
 
 pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock>;
+
+    /// Validate a legacy structural count that may have wrapped modulo 65536.
+    ///
+    /// Returns an exact count only when the codec can prove a unique count from the
+    /// payload layout and the declared residue, without decoding or allocating.
+    /// Unsupported codecs return None; inconsistent supported layouts return an error.
+    /// This is only called for mini-block structural levels, not ordinary values.
+    fn infer_u16_wrapped_count(
+        &self,
+        _data: &LanceBuffer,
+        _declared_count: u16,
+    ) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 pub trait DecompressionStrategy: std::fmt::Debug + Send + Sync {
