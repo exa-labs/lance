@@ -524,10 +524,14 @@ impl BlockDecompressor for OutOfLineBitpacking {
                         "bitpacked structural count overflow",
                     )
                 })?;
-            // A raw tail can occupy exactly one packed block. Legacy padded
-            // tails then have the same length but different contents; a unique
-            // count alone cannot tell us how to decode a recovered tail.
-            if count > residue && tail_values > 0 && padded_bytes == raw_bytes {
+            // At equal lengths, one-/two-bit packing leaves the raw tail
+            // unchanged. Wider packing can rearrange its bits, so the count
+            // alone cannot identify a recovered tail's layout.
+            if count > residue
+                && tail_values > 0
+                && padded_bytes == raw_bytes
+                && self.compressed_bit_width > 2
+            {
                 return Err(Error::corrupt_file(
                     "miniblock_levels".into(),
                     format!(
@@ -763,20 +767,27 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_wrapped_bitpacked_legacy_padded_tail() {
+    #[rstest]
+    #[case::small_tail(1, 65553)]
+    #[case::equal_one_bit_tail(1, 65600)]
+    #[case::equal_two_bit_tail(2, 65664)]
+    fn test_wrapped_bitpacked_legacy_padded_tail(
+        #[case] packed_width: usize,
+        #[case] num_values: usize,
+    ) {
         // Older writers padded even tiny tails instead of storing them raw.
-        let num_values = 65553;
-        let mut values = vec![1_u16; num_values];
-        values.resize(66560, 0);
+        let mut values: Vec<u16> = (0..num_values)
+            .map(|i| (i % (1 << packed_width)) as u16)
+            .collect();
+        values.resize(num_values.div_ceil(1024) * 1024, 0);
         let block = FixedWidthDataBlock {
             data: LanceBuffer::reinterpret_vec(values.clone()),
             bits_per_value: 16,
             num_values: values.len() as u64,
             block_info: BlockInfo::new(),
         };
-        let packed = bitpack_out_of_line::<u16>(block, 1);
-        let codec = OutOfLineBitpacking::new(1, 16);
+        let packed = bitpack_out_of_line::<u16>(block, packed_width);
+        let codec = OutOfLineBitpacking::new(packed_width as u64, 16);
         let inferred = codec
             .infer_u16_wrapped_count(&packed, num_values as u16)
             .unwrap()
@@ -795,8 +806,9 @@ mod test {
     }
 
     #[rstest]
-    #[case::one_bit(1, 64)]
-    #[case::two_bits(2, 128)]
+    #[case::three_bits(3, 192)]
+    #[case::four_bits(4, 256)]
+    #[case::eight_bits(8, 512)]
     #[case::fifteen_bits(15, 960)]
     fn test_wrapped_bitpacked_rejects_ambiguous_tail(#[case] width: u64, #[case] tail: u16) {
         let codec = OutOfLineBitpacking::new(width, 16);
