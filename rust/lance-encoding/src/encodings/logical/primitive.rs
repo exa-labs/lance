@@ -166,15 +166,87 @@ struct DecodeMiniBlockTask {
 }
 
 impl DecodeMiniBlockTask {
+    /// Resolve one count for both structural streams before decoding either one.
+    fn resolve_num_levels(
+        &self,
+        rep: Option<&LanceBuffer>,
+        def: Option<&LanceBuffer>,
+        declared_count: u16,
+    ) -> Result<u64> {
+        let mut inferred = None;
+        let mut has_unsupported_stream = false;
+        for (codec, data) in [
+            (self.rep_decompressor.as_deref(), rep),
+            (self.def_decompressor.as_deref(), def),
+        ] {
+            let count = match (codec, data) {
+                (Some(codec), Some(data)) => codec.infer_u16_wrapped_count(data, declared_count)?,
+                (None, None) => continue,
+                _ => {
+                    return Err(Error::corrupt_file(
+                        "miniblock_levels".into(),
+                        "structural codec and payload presence disagree",
+                    ));
+                }
+            };
+            if let Some(count) = count {
+                if count < u64::from(declared_count) || count % 65536 != u64::from(declared_count) {
+                    return Err(Error::corrupt_file(
+                        "miniblock_levels".into(),
+                        format!(
+                            "structural count {count} disagrees with header {declared_count} modulo 65536"
+                        ),
+                    ));
+                }
+                if inferred.is_some_and(|previous| previous != count) {
+                    return Err(Error::corrupt_file(
+                        "miniblock_levels".into(),
+                        format!(
+                            "structural streams disagree on level counts: {inferred:?} and {count}"
+                        ),
+                    ));
+                }
+                inferred = Some(count);
+            } else {
+                has_unsupported_stream = true;
+            }
+        }
+        let count = inferred.unwrap_or(u64::from(declared_count));
+        if count != u64::from(declared_count) && has_unsupported_stream {
+            return Err(Error::corrupt_file(
+                "miniblock_levels".into(),
+                "cannot validate a wrapped structural count with an unsupported companion codec",
+            ));
+        }
+        Ok(count)
+    }
+
     fn decode_levels(
         rep_decompressor: &dyn BlockDecompressor,
         levels: LanceBuffer,
-        num_levels: u16,
+        num_levels: u64,
     ) -> Result<ScalarBuffer<u16>> {
-        let rep = rep_decompressor.decompress(levels, num_levels as u64)?;
-        let rep = rep.as_fixed_width().unwrap();
-        debug_assert_eq!(rep.num_values, num_levels as u64);
-        debug_assert_eq!(rep.bits_per_value, 16);
+        let rep = rep_decompressor.decompress(levels, num_levels)?;
+        let rep = rep.as_fixed_width().ok_or_else(|| {
+            Error::corrupt_file(
+                "miniblock_levels".into(),
+                "structural levels did not decode to fixed-width data",
+            )
+        })?;
+        if rep.num_values != num_levels
+            || rep.bits_per_value != 16
+            || num_levels.checked_mul(2) != Some(rep.data.len() as u64)
+        {
+            return Err(Error::corrupt_file(
+                "miniblock_levels".into(),
+                format!(
+                    "structural levels must decode to {num_levels} u16 values, got {} values, {} bits per value, {} bytes",
+                    rep.num_values,
+                    rep.bits_per_value,
+                    rep.data.len()
+                ),
+            ));
+        }
         Ok(rep.data.borrow_to_typed_slice::<u16>())
     }
 
@@ -462,6 +534,21 @@ impl DecodeMiniBlockTask {
         buf: &LanceBuffer,
         items_in_chunk: u64,
     ) -> Result<DecodedMiniBlockChunk> {
+        let header_size = self
+            .num_buffers
+            .checked_mul(if self.has_large_chunk { 4 } else { 2 })
+            .and_then(|size| {
+                size.checked_add(
+                    2 + 2 * u64::from(self.rep_decompressor.is_some())
+                        + 2 * u64::from(self.def_decompressor.is_some()),
+                )
+            });
+        if header_size.is_none_or(|size| size > buf.len() as u64) {
+            return Err(Error::corrupt_file(
+                "miniblock_levels".into(),
+                "truncated mini-block header",
+            ));
+        }
         let mut offset = 0;
         let num_levels = u16::from_le_bytes([buf[offset], buf[offset + 1]]);
         offset += 2;
@@ -489,29 +576,42 @@ impl DecodeMiniBlockTask {
 
         offset += pad_bytes::<MINIBLOCK_ALIGNMENT>(offset);
 
-        let rep = rep_size.map(|rep_size| {
-            let rep = buf.slice_with_length(offset, rep_size as usize);
-            offset += rep_size as usize;
-            offset += pad_bytes::<MINIBLOCK_ALIGNMENT>(offset);
-            rep
-        });
-
-        let def = def_size.map(|def_size| {
-            let def = buf.slice_with_length(offset, def_size as usize);
-            offset += def_size as usize;
-            offset += pad_bytes::<MINIBLOCK_ALIGNMENT>(offset);
-            def
-        });
+        let take_buffer = |offset: &mut usize, size: usize| -> Result<LanceBuffer> {
+            let end = offset
+                .checked_add(size)
+                .filter(|end| *end <= buf.len())
+                .ok_or_else(|| {
+                    Error::corrupt_file(
+                        "miniblock_levels".into(),
+                        format!(
+                            "mini-block buffer at {offset} with {size} bytes exceeds chunk size {}",
+                            buf.len()
+                        ),
+                    )
+                })?;
+            let data = buf.slice_with_length(*offset, size);
+            *offset = end
+                .checked_add(pad_bytes::<MINIBLOCK_ALIGNMENT>(end))
+                .ok_or_else(|| {
+                    Error::corrupt_file(
+                        "miniblock_levels".into(),
+                        "mini-block buffer alignment overflow",
+                    )
+                })?;
+            Ok(data)
+        };
+        let rep = rep_size
+            .map(|size| take_buffer(&mut offset, size as usize))
+            .transpose()?;
+        let def = def_size
+            .map(|size| take_buffer(&mut offset, size as usize))
+            .transpose()?;
+        let num_levels = self.resolve_num_levels(rep.as_ref(), def.as_ref(), num_levels)?;
 
         let buffers = buffer_sizes
             .into_iter()
-            .map(|buf_size| {
-                let buf = buf.slice_with_length(offset, buf_size as usize);
-                offset += buf_size as usize;
-                offset += pad_bytes::<MINIBLOCK_ALIGNMENT>(offset);
-                buf
-            })
-            .collect::<Vec<_>>();
+            .map(|size| take_buffer(&mut offset, size as usize))
+            .collect::<Result<Vec<_>>>()?;
 
         let values = self
             .value_decompressor
@@ -5818,7 +5918,7 @@ mod tests {
         VariableFullZipDecoder,
     };
     use crate::buffer::LanceBuffer;
-    use crate::compression::DefaultDecompressionStrategy;
+    use crate::compression::{BlockCompressor, DefaultDecompressionStrategy};
     use crate::constants::{
         COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
         DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_META_KEY,
@@ -5829,16 +5929,178 @@ mod tests {
     use crate::encodings::logical::primitive::{
         ChunkDrainInstructions, PrimitiveStructuralEncoder, StructuralPrimitiveFieldDecoder,
     };
+    use crate::encodings::physical::{bitpacking::OutOfLineBitpacking, value::ValueDecompressor};
     use crate::format::ProtobufUtils21;
     use crate::format::pb21;
     use crate::format::pb21::compressive_encoding::Compression;
     use crate::repdef::build_control_word_iterator;
+    use crate::repdef::{CompositeRepDefUnraveler, DefinitionInterpretation, RepDefUnraveler};
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
     use crate::version::LanceFileVersion;
-    use arrow_array::{ArrayRef, Int8Array, StringArray};
+    use arrow_array::{Array, ArrayRef, Int8Array, LargeListArray, StringArray, UInt16Array};
     use arrow_schema::{DataType, Field as ArrowField};
+    use lance_core::Error;
+    use rstest::rstest;
     use std::collections::HashMap;
     use std::{collections::VecDeque, sync::Arc};
+
+    /// Construct a legacy chunk whose marker count was cast to u16 after packing.
+    fn wrapped_bitpacked_chunk(num_levels: usize) -> (DecodeMiniBlockTask, LanceBuffer) {
+        let num_values = 2048;
+        let null_lists = num_levels - num_values;
+        let mut rep = vec![1_u16; null_lists + 1];
+        rep.resize(num_levels, 0);
+        let mut def = vec![1_u16; null_lists];
+        def.resize(num_levels, 0);
+        let codec = Arc::new(OutOfLineBitpacking::new(1, 16));
+        let pack = |levels: Vec<u16>| {
+            codec
+                .compress(DataBlock::FixedWidth(FixedWidthDataBlock {
+                    num_values: levels.len() as u64,
+                    data: LanceBuffer::reinterpret_vec(levels),
+                    bits_per_value: 16,
+                    block_info: BlockInfo::new(),
+                }))
+                .unwrap()
+        };
+        let rep = pack(rep);
+        let def = pack(def);
+        let mut bytes = Vec::new();
+        for size in [
+            num_levels as u16,
+            rep.len() as u16,
+            def.len() as u16,
+            (num_values * 2) as u16,
+        ] {
+            bytes.extend_from_slice(&size.to_le_bytes());
+        }
+        for buffer in [
+            rep,
+            def,
+            LanceBuffer::reinterpret_vec((0..num_values as u16).collect()),
+        ] {
+            bytes.extend_from_slice(buffer.as_ref());
+            bytes.resize(bytes.len().div_ceil(8) * 8, 0);
+        }
+        let task = DecodeMiniBlockTask {
+            rep_decompressor: Some(codec.clone()),
+            def_decompressor: Some(codec),
+            value_decompressor: Arc::new(ValueDecompressor::from_flat(&pb21::Flat {
+                bits_per_value: 16,
+                data: None,
+            })),
+            dictionary_data: None,
+            def_meaning: Arc::from([
+                DefinitionInterpretation::AllValidItem,
+                DefinitionInterpretation::NullableList,
+            ]),
+            num_buffers: 1,
+            max_visible_level: 0,
+            instructions: Vec::new(),
+            has_large_chunk: false,
+        };
+        (task, LanceBuffer::from(bytes))
+    }
+
+    #[rstest]
+    #[case::ordinary(6520)]
+    #[case::wrapped(72056)]
+    #[case::zero_header(65536)]
+    #[case::multiple_wraps(131089)]
+    fn test_wrapped_bitpacked_miniblock_lists(#[case] num_levels: usize) {
+        let (task, bytes) = wrapped_bitpacked_chunk(num_levels);
+        let decoded = task.decode_miniblock_chunk(&bytes, 2048).unwrap();
+        let null_lists = num_levels - 2048;
+        let rep = decoded.rep.unwrap();
+        let def = decoded.def.unwrap();
+        assert_eq!(rep.len(), num_levels);
+        assert_eq!(def.len(), num_levels);
+        assert!(rep[..null_lists + 1].iter().all(|&level| level == 1));
+        assert!(rep[null_lists + 1..].iter().all(|&level| level == 0));
+        assert!(def[..null_lists].iter().all(|&level| level == 1));
+        assert!(def[null_lists..].iter().all(|&level| level == 0));
+        let values = decoded
+            .values
+            .as_fixed_width()
+            .unwrap()
+            .data
+            .borrow_to_typed_slice::<u16>();
+        assert_eq!(
+            values.as_ref(),
+            (0..2048_u16).collect::<Vec<_>>().as_slice()
+        );
+        let mut repdef = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            Some(rep.to_vec()),
+            Some(def.to_vec()),
+            task.def_meaning,
+            2048,
+        )]);
+        assert!(repdef.unravel_validity(2048).is_none());
+        let (offsets, validity) = repdef.unravel_offsets::<i64>().unwrap();
+        let lists = LargeListArray::try_new(
+            Arc::new(ArrowField::new("item", DataType::UInt16, false)),
+            offsets,
+            Arc::new(UInt16Array::from(values.to_vec())),
+            validity,
+        )
+        .unwrap();
+        assert_eq!(lists.len(), null_lists + 1);
+        assert_eq!(lists.null_count(), null_lists);
+        assert!(
+            lists.value_offsets()[..null_lists + 1]
+                .iter()
+                .all(|&offset| offset == 0)
+        );
+        assert_eq!(lists.value_offsets()[null_lists + 1], 2048);
+        assert!(!lists.is_null(null_lists));
+    }
+
+    #[test]
+    fn test_wrapped_bitpacked_stream_disagreement() {
+        let (task, bytes) = wrapped_bitpacked_chunk(72056);
+        let rep = bytes.slice_with_length(8, 9088);
+        let def = rep.slice_with_length(0, 896);
+        let error = task
+            .resolve_num_levels(Some(&rep), Some(&def), 6520)
+            .unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("structural streams disagree"));
+    }
+
+    #[test]
+    fn test_wrapped_bitpacked_unsupported_companion() {
+        let (mut task, bytes) = wrapped_bitpacked_chunk(72056);
+        task.def_decompressor = Some(Arc::new(ValueDecompressor::from_flat(&pb21::Flat {
+            bits_per_value: 16,
+            data: None,
+        })));
+        let rep = bytes.slice_with_length(8, 9088);
+        let def = LanceBuffer::reinterpret_vec(vec![1_u16; 72056]);
+        let error = task
+            .resolve_num_levels(Some(&rep), Some(&def), 6520)
+            .unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("unsupported companion codec"));
+        let ordinary = rep.slice_with_length(0, 896);
+        assert_eq!(
+            task.resolve_num_levels(Some(&ordinary), Some(&def), 6520)
+                .unwrap(),
+            6520
+        );
+    }
+
+    #[rstest]
+    #[case::header(3)]
+    #[case::rep_payload(100)]
+    #[case::values(20000)]
+    fn test_wrapped_bitpacked_truncated_chunk(#[case] length: usize) {
+        let (task, bytes) = wrapped_bitpacked_chunk(72056);
+        let error = task
+            .decode_miniblock_chunk(&bytes.slice_with_length(0, length), 2048)
+            .unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("mini-block"));
+    }
 
     #[test]
     fn test_is_narrow() {
