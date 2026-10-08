@@ -1,0 +1,55 @@
+# Publishes a prebuilt Exa fork release from wheels committed on this branch.
+# The wheels were built with .github/exa-release/build-wheel.sh; this job only
+# checks their hashes and provenance and attaches them to the release.
+name: Publish Exa release v9.0.1-exa.17
+
+on:
+  push:
+    branches:
+      - exa-release/v9.0.1-exa.17
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      TAG: v9.0.1-exa.17
+      TARGET: 785db0b42e4ee0696a4589a3d03285fca1ef320a
+      X86_SHA256: c248767f58eada56036c6006afe6e509c362246fdeb3468aa2dafc54cba42ac0
+      ARM_SHA256: 0b69c1de666f0b56072961b500c4afbbc2813a1434c15ce790f42b0092b573c8
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          sparse-checkout: exa-release-artifacts
+      - name: Collect wheels and provenance
+        run: mv exa-release-artifacts release
+      - name: Verify hashes and provenance
+        working-directory: release
+        run: |
+          set -euo pipefail
+          echo "${X86_SHA256}  pylance-9.0.1+exa.17-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" | sha256sum --check
+          echo "${ARM_SHA256}  pylance-9.0.1+exa.17-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl" | sha256sum --check
+          for p in *.provenance.txt; do
+            grep -Fx "source_commit=${TARGET}" "$p"
+            grep -Fx "wheel_sha256=$(sha256sum "${p%.provenance.txt}" | cut -d ' ' -f1)" "$p"
+            grep -Fx "release: 1.91.0" "$p"
+            grep -Fx "zig_version=0.16.0" "$p"
+            grep -Fx "maturin_version=maturin 1.15.0" "$p"
+          done
+      - name: Create release
+        working-directory: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${TAG}" -R "${GITHUB_REPOSITORY}" --target "${TARGET}" --title "v9.0.1+exa.17" --notes "Exa fork release based on commit ${TARGET}.
+
+          This release includes #55 (write_deletions reads the dataset version id directly instead of building a manifest summary) and #57 (recover wrapped bitpacked structural counts).
+
+          The x86_64 and aarch64 manylinux2014 wheels were each built once from a clean checkout of ${TARGET} using .github/exa-release/build-wheel.sh with the pinned Rust 1.91.0, Zig 0.16.0, maturin 1.15.0, and protoc 24.4 toolchain, and both passed validate-wheel.sh. Per-wheel provenance files are attached.
+
+          SHA-256:
+          - x86_64: ${X86_SHA256}
+          - aarch64: ${ARM_SHA256}" *.whl *.provenance.txt
