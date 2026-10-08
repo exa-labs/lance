@@ -414,6 +414,31 @@ impl Writer for ObjectWriter {
         Ok(self.cursor)
     }
 
+    /// Unlike a flush, this does not wait for in-flight parts: they run as
+    /// spawned tasks and finish without being polled, and `poll_write` already
+    /// caps them at [`max_upload_parallelism`]. The multipart creation request
+    /// is an unspawned future, so that one is still awaited.
+    async fn drive_in_flight_writes(&mut self) -> Result<()> {
+        std::future::poll_fn(|cx| {
+            Pin::new(&mut *self).poll_tasks(cx)?;
+            match &self.state {
+                UploadState::Started(_) | UploadState::InProgress { .. } | UploadState::Done(_) => {
+                    Poll::Ready(Ok(()))
+                }
+                UploadState::CreatingUpload(_)
+                | UploadState::PuttingSingle(_)
+                | UploadState::Completing(_) => Poll::Pending,
+            }
+        })
+        .await
+        .map_err(|e: io::Error| {
+            Error::io(format!(
+                "failed to advance object writer for {}: {}",
+                self.path, e
+            ))
+        })
+    }
+
     async fn shutdown(&mut self) -> Result<WriteResult> {
         AsyncWriteExt::shutdown(self).await.map_err(|e| {
             Error::io(format!(
@@ -642,9 +667,180 @@ fn get_inode(_metadata: &std::fs::Metadata) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use futures::stream::BoxStream;
+    use object_store::memory::InMemory;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, RenameOptions, UploadPart,
+    };
     use tokio::io::AsyncWriteExt;
+    use tokio::sync::Semaphore;
 
     use super::*;
+
+    /// An in-memory store whose multipart part uploads do not complete until
+    /// `gate` has a permit, so a test can hold parts in flight.
+    #[derive(Debug)]
+    struct GatedStore {
+        inner: Arc<InMemory>,
+        gate: Arc<Semaphore>,
+    }
+
+    impl std::fmt::Display for GatedStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "GatedStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for GatedStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            let inner = self.inner.put_multipart_opts(location, opts).await?;
+            Ok(Box::new(GatedUpload {
+                inner,
+                gate: self.gate.clone(),
+            }))
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+
+        async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OSResult<()> {
+            self.inner.rename_opts(from, to, opts).await
+        }
+    }
+
+    #[derive(Debug)]
+    struct GatedUpload {
+        inner: Box<dyn MultipartUpload>,
+        gate: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl MultipartUpload for GatedUpload {
+        fn put_part(&mut self, data: PutPayload) -> UploadPart {
+            // Submit to the inner upload now so part order is fixed at submission,
+            // as it is for a real store; only completion waits on the gate.
+            let upload = self.inner.put_part(data);
+            let gate = self.gate.clone();
+            Box::pin(async move {
+                let _permit = gate.acquire().await.expect("gate is never closed");
+                upload.await
+            })
+        }
+
+        async fn complete(&mut self) -> OSResult<PutResult> {
+            self.inner.complete().await
+        }
+
+        async fn abort(&mut self) -> OSResult<()> {
+            self.inner.abort().await
+        }
+    }
+
+    fn in_flight_parts(writer: &ObjectWriter) -> usize {
+        match &writer.state {
+            UploadState::InProgress { futures, .. } => futures.len(),
+            _ => 0,
+        }
+    }
+
+    /// Writing in part-sized batches with `drive_in_flight_writes` between them
+    /// keeps every part in flight, whereas a flush waits for all of them.
+    #[tokio::test(start_paused = true)]
+    async fn test_drive_in_flight_writes_does_not_wait_for_parts() {
+        let memory = Arc::new(InMemory::new());
+        let gate = Arc::new(Semaphore::new(0));
+        let path = Path::from("gated");
+        let mut writer = ObjectWriter {
+            state: UploadState::Started(Arc::new(GatedStore {
+                inner: memory.clone(),
+                gate: gate.clone(),
+            })),
+            path: Arc::new(path.clone()),
+            cursor: 0,
+            buffer: Vec::with_capacity(initial_upload_size()),
+            use_constant_size_upload_parts: false,
+        };
+
+        let part_size = initial_upload_size();
+        let num_parts = 3;
+        let data: Vec<u8> = (0..part_size * num_parts + 1000)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let (full_parts, tail) = data.split_at(part_size * num_parts);
+
+        for (idx, batch) in full_parts.chunks(part_size).enumerate() {
+            writer.write_all(batch).await.unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                Writer::drive_in_flight_writes(&mut writer),
+            )
+            .await
+            .expect("drive_in_flight_writes waited for a gated part")
+            .unwrap();
+            assert_eq!(in_flight_parts(&writer), idx + 1);
+        }
+        writer.write_all(tail).await.unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), writer.flush())
+                .await
+                .is_err(),
+            "flush should wait for the gated parts"
+        );
+        assert_eq!(in_flight_parts(&writer), num_parts);
+
+        gate.add_permits(1);
+        let result = Writer::shutdown(&mut writer).await.unwrap();
+        assert_eq!(result.size, data.len());
+
+        let written = memory.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(written.as_ref(), data.as_slice());
+    }
 
     #[tokio::test]
     async fn test_write() {

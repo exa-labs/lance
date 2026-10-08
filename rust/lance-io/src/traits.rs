@@ -30,12 +30,30 @@ pub trait Writer: AsyncWrite + Unpin + Send {
     /// Flush all buffered data and finalize the write, returning metadata about
     /// the written object.
     async fn shutdown(&mut self) -> Result<WriteResult>;
+
+    /// Advance writes already handed to the underlying store, waiting only for
+    /// those that would not progress without this writer being polled.
+    ///
+    /// Callers use this between batches instead of a full flush, so a writer
+    /// whose submitted writes complete on their own (such as multipart part
+    /// uploads running as spawned tasks) can keep several of them in flight
+    /// while the caller produces the next batch. Durability is still only
+    /// guaranteed by [`Self::shutdown`]. The default waits for every
+    /// submitted write, exactly like a flush.
+    async fn drive_in_flight_writes(&mut self) -> Result<()> {
+        AsyncWriteExt::flush(self).await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl Writer for Box<dyn Writer> {
     async fn tell(&mut self) -> Result<usize> {
         self.as_mut().tell().await
+    }
+
+    async fn drive_in_flight_writes(&mut self) -> Result<()> {
+        self.as_mut().drive_in_flight_writes().await
     }
 
     async fn shutdown(&mut self) -> Result<WriteResult> {
