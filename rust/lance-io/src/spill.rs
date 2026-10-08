@@ -179,6 +179,10 @@ impl Writer for SpillWriter {
         self.inner.tell().await
     }
 
+    async fn drive_in_flight_writes(&mut self) -> Result<()> {
+        self.inner.drive_in_flight_writes().await
+    }
+
     async fn shutdown(&mut self) -> Result<WriteResult> {
         let result = self.inner.shutdown().await?;
         // Signal the paired `Spill` that the bytes are now complete. `Relaxed`
