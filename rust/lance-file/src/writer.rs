@@ -2455,6 +2455,63 @@ mod tests {
         assert_eq!(read.columns(), batch.columns());
     }
 
+    #[rstest]
+    #[tokio::test]
+    async fn test_column_chunking_pages_below_cache_budget(
+        #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
+    ) {
+        // 1 MiB of u64 split into 256 KiB chunks: every chunk stays below the
+        // writer's default per-column cache, so pages only split if each
+        // chunk is flushed at its boundary.
+        let values = UInt64Array::from_iter_values(0..(1 << 17));
+        let batch =
+            RecordBatch::try_from_iter(vec![("values", Arc::new(values) as ArrayRef)]).unwrap();
+        let strategy = ColumnChunkingStrategy::try_new(
+            StructuralEncodingStrategy::with_version(version),
+            256 * 1024,
+        )
+        .unwrap();
+        let options = FileWriterOptions {
+            format_version: Some(version),
+            encoding_strategy: Some(Arc::new(strategy)),
+            ..Default::default()
+        };
+
+        let fs = FsFixture::default();
+        let mut writer = FileWriter::try_new(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            LanceSchema::try_from(batch.schema().as_ref()).unwrap(),
+            options,
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.add_schema_metadata("foo", "bar");
+        writer.finish().await.unwrap();
+
+        let file_reader = FileReader::try_open(
+            fs.scheduler
+                .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+                .await
+                .unwrap(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(file_reader.metadata().column_metadatas[0].pages.len(), 4);
+
+        let read = crate::testing::read_lance_file(
+            &fs,
+            Arc::<DecoderPlugins>::default(),
+            FilterExpression::no_filter(),
+        )
+        .await;
+        let read = arrow_select::concat::concat_batches(&read[0].schema(), &read).unwrap();
+        assert_eq!(read.columns(), batch.columns());
+    }
+
     fn spill_config() -> (TempObjFile, Arc<ObjectStore>) {
         let spill_path = TempObjFile::default();
         (spill_path, Arc::new(ObjectStore::local()))
