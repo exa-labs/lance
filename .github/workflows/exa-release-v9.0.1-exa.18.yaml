@@ -16,40 +16,7 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      matrix:
-        arch:
-        - x86_64
-        - aarch64
-    steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      with:
-        path: release-tools
-        persist-credentials: false
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      with:
-        ref: 3b75dabdd910d028864406c893e2fb7584758c36
-        path: source
-        persist-credentials: false
-    - name: Install host tools
-      run: sudo apt-get update && sudo apt-get install -y clang pkg-config unzip xz-utils
-    - name: Build with pinned release toolchain
-      env:
-        CARGO_BUILD_JOBS: '2'
-      run: bash release-tools/ci/exa-release.sh build ${{ matrix.arch }}
-    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-      with:
-        name: wheel-${{ matrix.arch }}
-        path: |
-          dist/${{ matrix.arch }}/*.whl
-          dist/${{ matrix.arch }}/*.provenance.txt
-        if-no-files-found: error
   smoke:
-    needs: build
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -75,22 +42,11 @@ jobs:
       with:
         path: release-tools
         persist-credentials: false
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      with:
-        ref: 3b75dabdd910d028864406c893e2fb7584758c36
-        path: source
-        persist-credentials: false
-    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-      with:
-        name: wheel-${{ matrix.arch }}
-        path: dist/${{ matrix.arch }}
     - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
     - name: Native LocalStack and HTTPS smoke test
       run: bash release-tools/ci/exa-release.sh smoke ${{ matrix.arch }}
   publish:
-    needs:
-    - build
-    - smoke
+    needs: smoke
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     permissions:
@@ -100,16 +56,6 @@ jobs:
       with:
         path: release-tools
         persist-credentials: false
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      with:
-        ref: 3b75dabdd910d028864406c893e2fb7584758c36
-        path: source
-        persist-credentials: false
-    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-      with:
-        pattern: wheel-*
-        path: dist
-        merge-multiple: true
     - name: Verify and publish immutable wheels
       env:
         GH_TOKEN: ${{ github.token }}
