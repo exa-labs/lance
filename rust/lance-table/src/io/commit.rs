@@ -39,14 +39,18 @@ use futures::{
     stream::BoxStream,
 };
 use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
-use lance_io::object_writer::{ObjectWriter, WriteResult, get_etag, max_upload_parallelism};
+#[cfg(feature = "conditional-multipart-commit")]
+use lance_io::object_writer::max_upload_parallelism;
+use lance_io::object_writer::{ObjectWriter, WriteResult, get_etag};
 use log::warn;
 use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::PutOptions;
 use object_store::{
-    Error as ObjectStoreError, MultipartUpload, ObjectStore as OSObjectStore, PutMode,
-    PutMultipartOptions, PutPayload, PutResult, path::Path,
+    Error as ObjectStoreError, ObjectStore as OSObjectStore, PutMode, PutPayload, PutResult,
+    path::Path,
 };
+#[cfg(feature = "conditional-multipart-commit")]
+use object_store::{MultipartUpload, PutMultipartOptions};
 use tracing::info;
 use url::Url;
 
@@ -1525,6 +1529,7 @@ const MIN_MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
 /// default) threshold divided across `max_upload_parallelism()` (10 by
 /// default) parts would otherwise produce ~1 part every ~800 KiB; the floor
 /// keeps a manifest that size to a single part instead.
+#[cfg(feature = "conditional-multipart-commit")]
 const MANIFEST_MULTIPART_MIN_PART_SIZE: usize = 32 * 1024 * 1024;
 
 /// Cap on a manifest multipart part size, so that a single part doesn't
@@ -1535,6 +1540,7 @@ const MANIFEST_MULTIPART_MIN_PART_SIZE: usize = 32 * 1024 * 1024;
 /// [`ObjectWriter`]'s data-file parts, so manifest and data-file part sizes
 /// converge on the same practical upper bound -- a coincidence worth keeping
 /// rather than picking an unrelated number.
+#[cfg(feature = "conditional-multipart-commit")]
 const MANIFEST_MULTIPART_MAX_PART_SIZE: usize = 256 * 1024 * 1024;
 
 /// Chooses a part size for a manifest multipart upload of `total_len` bytes.
@@ -1569,6 +1575,7 @@ const MANIFEST_MULTIPART_MAX_PART_SIZE: usize = 256 * 1024 * 1024;
 /// manifest just over the 8 MiB threshold divides to under the 32 MiB floor,
 /// clamping up to 1 part; a 100 GiB manifest would divide to ~10 GiB/part,
 /// clamped down to the 256 MiB cap, yielding ~400 parts across ~40 waves.
+#[cfg(feature = "conditional-multipart-commit")]
 fn manifest_multipart_part_size(total_len: usize) -> usize {
     let target_parts = max_upload_parallelism().max(1);
     total_len.div_ceil(target_parts).clamp(
@@ -1593,6 +1600,7 @@ fn manifest_multipart_threshold() -> usize {
 /// Outcome of attempting a conditional multipart upload for the manifest.
 enum MultipartCommitOutcome {
     /// The multipart upload completed (conditionally) successfully.
+    #[cfg(feature = "conditional-multipart-commit")]
     Completed(PutResult),
     /// The backend does not support conditional completion of a multipart
     /// upload. No data was written (or it was already cleaned up); the
@@ -1606,6 +1614,7 @@ enum MultipartCommitOutcome {
 /// This never falls back internally: `Unsupported` is returned so the caller
 /// can retry with a single PUT using the same conflict-mapping semantics as
 /// [`single_conditional_put`].
+#[cfg(feature = "conditional-multipart-commit")]
 async fn try_conditional_multipart_put(
     object_store: &ObjectStore,
     path: &Path,
@@ -1665,8 +1674,21 @@ async fn try_conditional_multipart_put(
     }
 }
 
+/// Without the `conditional-multipart-commit` feature the object store cannot
+/// complete a multipart upload conditionally, so every manifest takes the
+/// single-PUT path, exactly as on stores that report `NotImplemented`.
+#[cfg(not(feature = "conditional-multipart-commit"))]
+async fn try_conditional_multipart_put(
+    _object_store: &ObjectStore,
+    _path: &Path,
+    _chunks: &[Bytes],
+) -> std::result::Result<MultipartCommitOutcome, CommitError> {
+    Ok(MultipartCommitOutcome::Unsupported)
+}
+
 /// Split the concatenation of `chunks` into consecutive payloads of
 /// `part_size` bytes (the last one may be shorter) without copying.
+#[cfg(feature = "conditional-multipart-commit")]
 fn split_into_parts(chunks: &[Bytes], part_size: usize) -> Vec<PutPayload> {
     let mut parts = Vec::new();
     let mut part = Vec::new();
@@ -1752,6 +1774,7 @@ impl CommitHandler for ConditionalPutCommitHandler {
 
         let res = if size > manifest_multipart_threshold() {
             match try_conditional_multipart_put(object_store, &path, &chunks).await? {
+                #[cfg(feature = "conditional-multipart-commit")]
                 MultipartCommitOutcome::Completed(res) => res,
                 // The store can't do a conditional multipart complete (e.g.
                 // GCS). Fall back to the single-PUT path so we never
@@ -2519,6 +2542,7 @@ mod tests {
     /// end-to-end -- not just the pure sizing function -- at a size well
     /// beyond a toy few-MB payload, while staying cheap to allocate and
     /// upload against the in-memory store in a unit test.
+    #[cfg(feature = "conditional-multipart-commit")]
     fn large_multipart_manifest_writer<'a>(
         object_store: &'a ObjectStore,
         _manifest: &'a mut Manifest,
@@ -2537,6 +2561,7 @@ mod tests {
     /// `MANIFEST_MULTIPART_MIN_PART_SIZE` (32 MiB) floor, small enough to
     /// allocate and upload cheaply in a unit test against the in-memory
     /// store.
+    #[cfg(feature = "conditional-multipart-commit")]
     const LARGE_MULTIPART_MANIFEST_PAYLOAD_LEN: usize = 130 * 1024 * 1024;
 
     fn test_manifest() -> Manifest {
@@ -2560,6 +2585,7 @@ mod tests {
     /// A manifest large enough to exceed the multipart threshold is written
     /// via a conditional multipart upload, and the resulting object is
     /// readable and complete.
+    #[cfg(feature = "conditional-multipart-commit")]
     #[tokio::test]
     async fn test_conditional_put_commit_uses_multipart_for_large_manifest() {
         let object_store = ObjectStore::memory();
@@ -2589,6 +2615,7 @@ mod tests {
     /// A lost `PutMode::Create` race on the multipart path must surface as
     /// [`CommitError::CommitConflict`], exactly as it does on the small
     /// single-PUT path, so Lance's commit-retry loop still works.
+    #[cfg(feature = "conditional-multipart-commit")]
     #[tokio::test]
     async fn test_conditional_put_commit_multipart_conflict() {
         let object_store = ObjectStore::memory();
@@ -2626,6 +2653,35 @@ mod tests {
             matches!(result, Err(CommitError::CommitConflict)),
             "expected a commit conflict, got {result:?}"
         );
+    }
+
+    /// Without `conditional-multipart-commit`, a manifest over the multipart
+    /// threshold is still committed whole, through the single-PUT path.
+    #[cfg(not(feature = "conditional-multipart-commit"))]
+    #[tokio::test]
+    async fn test_conditional_put_commit_large_manifest_uses_single_put_without_feature() {
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("test");
+        let mut manifest = test_manifest();
+
+        let location = ConditionalPutCommitHandler
+            .commit(
+                &mut manifest,
+                None,
+                &base_path,
+                &object_store,
+                fixed_size_manifest_writer,
+                ManifestNamingScheme::V2,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(OVERSIZED_MANIFEST_PAYLOAD_LEN > manifest_multipart_threshold());
+        assert_eq!(location.size, Some(OVERSIZED_MANIFEST_PAYLOAD_LEN as u64));
+        let bytes = object_store.read_one_all(&location.path).await.unwrap();
+        assert_eq!(bytes.len(), OVERSIZED_MANIFEST_PAYLOAD_LEN);
+        assert!(bytes.iter().all(|&b| b == 7));
     }
 
     /// Manifests at or below the threshold keep using the original
@@ -2670,6 +2726,7 @@ mod tests {
     /// `LANCE_UPLOAD_CONCURRENCY` override in the test environment), same as
     /// other tests in this module assume `manifest_multipart_threshold()`'s
     /// default.
+    #[cfg(feature = "conditional-multipart-commit")]
     #[test]
     fn test_manifest_multipart_part_size() {
         const MIB: usize = 1024 * 1024;
@@ -2728,6 +2785,7 @@ mod tests {
     /// concurrent parts under the old (threshold-as-part-size, no
     /// concurrency cap) implementation now uploads as a small, bounded
     /// number of parts and is still byte-for-byte correct.
+    #[cfg(feature = "conditional-multipart-commit")]
     #[tokio::test]
     async fn test_conditional_put_commit_multipart_realistic_size() {
         let object_store = ObjectStore::memory();
@@ -2767,6 +2825,7 @@ mod tests {
         assert!(bytes.iter().all(|&b| b == 7));
     }
 
+    #[cfg(feature = "conditional-multipart-commit")]
     #[test]
     fn test_split_into_parts_crosses_chunk_boundaries() {
         let chunks = vec![

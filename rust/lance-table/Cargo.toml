@@ -60,6 +60,11 @@ prost-build.workspace = true
 protobuf-src = { version = "2.1", optional = true }
 
 [features]
+default = ["conditional-multipart-commit"]
+# Conditional (`PutMode::Create`) multipart completion for large manifest
+# commits. Requires an object_store that supports `PutMultipartOptions::mode`;
+# without it, every manifest is committed with a single conditional PUT.
+conditional-multipart-commit = []
 dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-credential-types", "lance-io/aws"]
 protoc = ["dep:protobuf-src"]
 
