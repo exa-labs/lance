@@ -1112,7 +1112,9 @@ mod tests {
     use lance_datagen::{ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_batch};
     use lance_encoding::compression_config::{CompressionFieldParams, CompressionParams};
     use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-    use lance_encoding::encoder::{ColumnChunkingStrategy, StructuralEncodingStrategy};
+    use lance_encoding::encoder::{
+        ColumnChunkingStrategy, MIN_CHUNK_BYTES, StructuralEncodingStrategy,
+    };
     use lance_encoding::version::LanceFileVersion;
     use lance_io::object_store::ObjectStore;
     use lance_io::utils::CachedFileSize;
@@ -2386,14 +2388,15 @@ mod tests {
     async fn test_column_chunking_splits_large_columns(
         #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
     ) {
-        // Nulls every 16th row leave most chunks of the nullable payload column
-        // all-valid, which is the layout a chunked page must survive.
-        let nulls: Vec<bool> = (0..16).map(|i| i == 15).collect();
+        // ~25 MB of payload in 8 MiB chunks. Only the last row is null, so
+        // most chunks of the nullable payload column are all-valid, which is
+        // the layout a chunked page must survive.
+        let nulls: Vec<bool> = (0..64).map(|i| i == 63).collect();
         let batch = gen_batch()
             .col("id", array::step::<arrow_array::types::Int32Type>())
             .col(
                 "payload",
-                array::rand_varbin(ByteCount::from(30_000), ByteCount::from(50_000))
+                array::rand_varbin(ByteCount::from(300_000), ByteCount::from(500_000))
                     .with_nulls(&nulls),
             )
             .into_batch_rows(RowCount::from(64))
@@ -2401,7 +2404,7 @@ mod tests {
         let lance_schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
         let strategy = ColumnChunkingStrategy::try_new(
             StructuralEncodingStrategy::with_version(version),
-            256 * 1024,
+            MIN_CHUNK_BYTES,
         )
         .unwrap();
         let options = FileWriterOptions {
@@ -2460,20 +2463,21 @@ mod tests {
     async fn test_column_chunking_pages_below_cache_budget(
         #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
     ) {
-        // 1 MiB of u64 split into 256 KiB chunks: every chunk stays below the
-        // writer's default per-column cache, so pages only split if each
-        // chunk is flushed at its boundary.
-        let values = UInt64Array::from_iter_values(0..(1 << 17));
+        // 32 MiB of u64 in 8 MiB chunks under a 64 MiB per-column cache:
+        // every chunk stays below the cache budget, so pages only split if
+        // each chunk is flushed at its boundary.
+        let values = UInt64Array::from_iter_values(0..(4 << 20));
         let batch =
             RecordBatch::try_from_iter(vec![("values", Arc::new(values) as ArrayRef)]).unwrap();
         let strategy = ColumnChunkingStrategy::try_new(
             StructuralEncodingStrategy::with_version(version),
-            256 * 1024,
+            MIN_CHUNK_BYTES,
         )
         .unwrap();
         let options = FileWriterOptions {
             format_version: Some(version),
             encoding_strategy: Some(Arc::new(strategy)),
+            data_cache_bytes: Some(64 * 1024 * 1024),
             ..Default::default()
         };
 

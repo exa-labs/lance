@@ -30,12 +30,17 @@ use crate::repdef::RepDefBuilder;
 /// The chunk count is computed per column and per `write_batch`, so a column
 /// smaller than `chunk_bytes` is passed through as a single chunk. Nested
 /// fields are built by the inner strategy and are never chunked themselves,
-/// and a column containing a dictionary at any depth is never split. When a column is split, each chunk
-/// becomes its own page, so the setting trades page count for encode
-/// parallelism.
+/// and a column containing a dictionary at any depth is never split. When a
+/// column is split, each chunk becomes its own page, so the setting trades
+/// page count for encode parallelism.
 ///
 /// `S` is typically [`super::StructuralEncodingStrategy`]: 2.0 files already
 /// split large pages through `max_page_bytes`.
+/// Smallest accepted `chunk_bytes`: the writer's default per-column cache
+/// budget, i.e. the smallest page an unchunked column normally produces. A
+/// smaller target would only add pages and per-page overhead.
+pub const MIN_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+
 #[derive(Debug)]
 pub struct ColumnChunkingStrategy<S> {
     inner: S,
@@ -44,12 +49,13 @@ pub struct ColumnChunkingStrategy<S> {
 
 impl<S: FieldEncodingStrategy> ColumnChunkingStrategy<S> {
     /// `chunk_bytes` is the target in-memory size (arrow buffer bytes) of one
-    /// chunk of a top-level column; it must be greater than zero.
+    /// chunk of a top-level column; it must be at least [`MIN_CHUNK_BYTES`].
     pub fn try_new(inner: S, chunk_bytes: u64) -> Result<Self> {
-        if chunk_bytes == 0 {
-            return Err(Error::invalid_input(
-                "ColumnChunkingStrategy chunk_bytes must be greater than zero, got 0",
-            ));
+        if chunk_bytes < MIN_CHUNK_BYTES {
+            return Err(Error::invalid_input(format!(
+                "ColumnChunkingStrategy chunk_bytes must be at least {MIN_CHUNK_BYTES} bytes \
+                 (MIN_CHUNK_BYTES), got {chunk_bytes}"
+            )));
         }
         Ok(Self { inner, chunk_bytes })
     }
@@ -345,18 +351,30 @@ mod tests {
         assert_eq!(ranges.last().unwrap().end, 100);
     }
 
-    #[test]
-    fn test_zero_chunk_bytes_rejected() {
+    #[rstest]
+    #[case::zero(0)]
+    #[case::just_below_minimum(MIN_CHUNK_BYTES - 1)]
+    fn test_chunk_bytes_below_minimum_rejected(#[case] chunk_bytes: u64) {
         let error = ColumnChunkingStrategy::try_new(
             StructuralEncodingStrategy::with_version(LanceFileVersion::V2_2),
-            0,
+            chunk_bytes,
         )
         .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(
             error
                 .to_string()
-                .contains("chunk_bytes must be greater than zero")
+                .contains(&format!("must be at least {MIN_CHUNK_BYTES} bytes"))
         );
+        assert!(error.to_string().contains(&format!("got {chunk_bytes}")));
+    }
+
+    #[test]
+    fn test_minimum_chunk_bytes_accepted() {
+        ColumnChunkingStrategy::try_new(
+            StructuralEncodingStrategy::with_version(LanceFileVersion::V2_2),
+            MIN_CHUNK_BYTES,
+        )
+        .unwrap();
     }
 }
