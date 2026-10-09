@@ -116,6 +116,52 @@ tools like Ray). Keep in mind that decoding data is a compute intensive operatio
 seems I/O bound (like scanning a table) it may still need quite a few compute threads to achieve peak
 performance.
 
+## Encoding Large Columns in Parallel
+
+Writing a file (2.1+) encodes each top-level column of a `write_batch` call as a single page, in a
+single task on the compute thread pool. When one column dominates a batch, for example a few hundred
+MB of documents or images in one binary column, its compression runs on one thread while the rest of
+the pool is idle.
+
+The Rust file writer can split such columns with `ColumnChunkingStrategy`. It wraps an encoding
+strategy and hands each top-level column to its encoder in row chunks of about `chunk_bytes` of
+in-memory data. Each chunk becomes its own page, and the pages of one column are compressed
+concurrently. The strategy is not available from Python or Java yet.
+
+```rust
+use lance_encoding::encoder::{ColumnChunkingStrategy, StructuralEncodingStrategy};
+
+let strategy = ColumnChunkingStrategy::try_new(
+    StructuralEncodingStrategy::with_version(version),
+    64 * 1024 * 1024,
+)?;
+let options = FileWriterOptions {
+    format_version: Some(version),
+    encoding_strategy: Some(Arc::new(strategy)),
+    ..Default::default()
+};
+```
+
+How chunks are chosen:
+
+- A column smaller than `chunk_bytes` is written as before, in one page. Only large columns split.
+- Chunk boundaries follow the data's size in bytes where a slice's size can be measured exactly
+  (primitives, strings, binary, and structs or fixed-size lists of these), so a cluster of large
+  values does not end up in one chunk. Other types, such as lists and maps, split into chunks of
+  equal row count.
+- A column that contains a dictionary at any depth is never split, because every page would
+  re-encode the whole shared dictionary.
+- Nested fields are never split on their own; a struct or list column is split by its top-level rows.
+- `chunk_bytes` must be at least `MIN_CHUNK_BYTES` (8 MiB), the smallest page an unchunked column
+  normally produces.
+
+Effect: a single 750 MB batch of 3,869 rows, dominated by one column of variable-width documents,
+wrote in 0.71 s without chunking and 0.15 s with 64 MiB chunks on a 14-core machine. File size grew
+by about 0.01% (the metadata of the extra pages), and point reads and full scans of the file were
+unchanged within measurement noise. The speedup is bounded by the number of compute threads
+(`LANCE_CPU_THREADS`) and by how many large columns are encoded at once, since concurrent writers
+share the same pool.
+
 ## Memory Requirements
 
 Lance is designed to be memory efficient. Operations should stream data from disk and not require
