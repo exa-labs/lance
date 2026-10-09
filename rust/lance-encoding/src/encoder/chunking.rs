@@ -30,7 +30,7 @@ use crate::repdef::RepDefBuilder;
 /// The chunk count is computed per column and per `write_batch`, so a column
 /// smaller than `chunk_bytes` is passed through as a single chunk. Nested
 /// fields are built by the inner strategy and are never chunked themselves,
-/// and dictionary columns are never split. When a column is split, each chunk
+/// and a column containing a dictionary at any depth is never split. When a column is split, each chunk
 /// becomes its own page, so the setting trades page count for encode
 /// parallelism.
 ///
@@ -138,15 +138,15 @@ impl FieldEncoder for ChunkingFieldEncoder {
 ///
 /// Boundaries follow the data's actual bytes when a slice's size can be
 /// measured exactly, so clustered large values don't pile into one chunk;
-/// other types split into ranges of equal row count. A dictionary column is
-/// returned whole, because every slice would carry the entire shared
-/// dictionary.
+/// other types split into ranges of equal row count. A column containing a
+/// dictionary at any depth is returned whole, because every slice would carry
+/// the entire shared dictionary into its own page.
 fn chunk_ranges(array: &dyn Array, chunk_bytes: u64) -> Result<Vec<Range<usize>>> {
     let num_rows = array.len();
     if num_rows == 0 {
         return Ok(Vec::new());
     }
-    if matches!(array.data_type(), DataType::Dictionary(..)) {
+    if contains_dictionary(array.data_type()) {
         return Ok(std::iter::once(0..num_rows).collect());
     }
     let total_bytes = slice_bytes(array, 0..num_rows)?;
@@ -199,6 +199,26 @@ fn slice_bytes(array: &dyn Array, rows: Range<usize>) -> Result<u64> {
         .slice(rows.start, rows.len())
         .to_data()
         .get_slice_memory_size()? as u64)
+}
+
+fn contains_dictionary(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(..) => true,
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| contains_dictionary(field.data_type())),
+        DataType::List(item)
+        | DataType::LargeList(item)
+        | DataType::ListView(item)
+        | DataType::LargeListView(item)
+        | DataType::FixedSizeList(item, _)
+        | DataType::Map(item, _) => contains_dictionary(item.data_type()),
+        DataType::RunEndEncoded(_, values) => contains_dictionary(values.data_type()),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| contains_dictionary(field.data_type())),
+        _ => false,
+    }
 }
 
 /// Whether [`arrow_data::ArrayData::get_slice_memory_size`] of a slice counts
@@ -290,6 +310,22 @@ mod tests {
         let keys = Int32Array::from_iter_values((0..10_000).map(|row| row % 4));
         let values = binary(&repeat(1 << 20, 4));
         let array = DictionaryArray::new(keys, values);
+        assert_eq!(chunk_ranges(&array, 1 << 16).unwrap(), vec![0..10_000]);
+    }
+
+    #[test]
+    fn test_chunk_ranges_keeps_nested_dictionary_whole() {
+        let keys = Int32Array::from_iter_values((0..10_000).map(|row| row % 4));
+        let dictionary: ArrayRef =
+            Arc::new(DictionaryArray::new(keys, binary(&repeat(1 << 20, 4))));
+        let array = StructArray::from(vec![(
+            Arc::new(ArrowField::new(
+                "tag",
+                dictionary.data_type().clone(),
+                false,
+            )),
+            dictionary,
+        )]);
         assert_eq!(chunk_ranges(&array, 1 << 16).unwrap(), vec![0..10_000]);
     }
 
