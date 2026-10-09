@@ -1109,9 +1109,10 @@ mod tests {
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_core::utils::tempfile::TempObjFile;
-    use lance_datagen::{BatchCount, RowCount, array, gen_batch};
+    use lance_datagen::{ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_batch};
     use lance_encoding::compression_config::{CompressionFieldParams, CompressionParams};
-    use lance_encoding::decoder::DecoderPlugins;
+    use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+    use lance_encoding::encoder::{ColumnChunkingStrategy, default_encoding_strategy};
     use lance_encoding::version::LanceFileVersion;
     use lance_io::object_store::ObjectStore;
     use lance_io::utils::CachedFileSize;
@@ -2378,6 +2379,78 @@ mod tests {
 
         // Verify first value matches what we wrote
         assert!(read_binary.value(0).iter().all(|&b| b == 42u8));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_column_chunking_splits_large_columns(
+        #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
+    ) {
+        // Nulls every 16th row leave most chunks of the nullable payload column
+        // all-valid, which is the layout a chunked page must survive.
+        let nulls: Vec<bool> = (0..16).map(|i| i == 15).collect();
+        let batch = gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "payload",
+                array::rand_varbin(ByteCount::from(30_000), ByteCount::from(50_000))
+                    .with_nulls(&nulls),
+            )
+            .into_batch_rows(RowCount::from(64))
+            .unwrap();
+        let lance_schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
+        let strategy =
+            ColumnChunkingStrategy::try_new(default_encoding_strategy(version), 256 * 1024)
+                .unwrap();
+        let options = FileWriterOptions {
+            format_version: Some(version),
+            encoding_strategy: Some(Arc::new(strategy)),
+            ..Default::default()
+        };
+
+        let fs = FsFixture::default();
+        let mut writer = FileWriter::try_new(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema,
+            options,
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.add_schema_metadata("foo", "bar");
+        writer.finish().await.unwrap();
+
+        let file_reader = FileReader::try_open(
+            fs.scheduler
+                .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+                .await
+                .unwrap(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let page_counts: Vec<usize> = file_reader
+            .metadata()
+            .column_metadatas
+            .iter()
+            .map(|column| column.pages.len())
+            .collect();
+        assert_eq!(page_counts[0], 1, "small column must stay one page");
+        assert!(
+            page_counts[1] > 1,
+            "large column must split: {page_counts:?}"
+        );
+
+        let read = crate::testing::read_lance_file(
+            &fs,
+            Arc::<DecoderPlugins>::default(),
+            FilterExpression::no_filter(),
+        )
+        .await;
+        let read = arrow_select::concat::concat_batches(&read[0].schema(), &read).unwrap();
+        assert_eq!(read.columns(), batch.columns());
     }
 
     fn spill_config() -> (TempObjFile, Arc<ObjectStore>) {

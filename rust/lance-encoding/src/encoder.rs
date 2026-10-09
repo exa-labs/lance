@@ -41,6 +41,10 @@ use crate::{
     format::pb,
 };
 
+mod chunking;
+
+pub use chunking::ColumnChunkingStrategy;
+
 /// The minimum alignment for a page buffer.  Writers must respect this.
 pub const MIN_PAGE_BUFFER_ALIGNMENT: u64 = 8;
 
