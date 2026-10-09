@@ -29,16 +29,19 @@ use crate::repdef::RepDefBuilder;
 /// fields are built by the inner strategy and are never chunked themselves.
 /// Each chunk becomes at least one page, so the setting trades page count for
 /// encode parallelism.
+///
+/// `S` is typically [`super::StructuralEncodingStrategy`]: 2.0 files already
+/// split large pages through `max_page_bytes`.
 #[derive(Debug)]
-pub struct ColumnChunkingStrategy {
-    inner: Box<dyn FieldEncodingStrategy>,
+pub struct ColumnChunkingStrategy<S> {
+    inner: S,
     chunk_bytes: u64,
 }
 
-impl ColumnChunkingStrategy {
+impl<S: FieldEncodingStrategy> ColumnChunkingStrategy<S> {
     /// `chunk_bytes` is the target in-memory size (arrow buffer bytes) of one
     /// chunk of a top-level column; it must be greater than zero.
-    pub fn try_new(inner: Box<dyn FieldEncodingStrategy>, chunk_bytes: u64) -> Result<Self> {
+    pub fn try_new(inner: S, chunk_bytes: u64) -> Result<Self> {
         if chunk_bytes == 0 {
             return Err(Error::invalid_input(
                 "ColumnChunkingStrategy chunk_bytes must be greater than zero, got 0",
@@ -48,7 +51,7 @@ impl ColumnChunkingStrategy {
     }
 }
 
-impl FieldEncodingStrategy for ColumnChunkingStrategy {
+impl<S: FieldEncodingStrategy> FieldEncodingStrategy for ColumnChunkingStrategy<S> {
     fn create_field_encoder(
         &self,
         _encoding_strategy_root: &dyn FieldEncodingStrategy,
@@ -59,9 +62,9 @@ impl FieldEncodingStrategy for ColumnChunkingStrategy {
         // The inner strategy is passed as the root so that only top-level
         // fields are wrapped: a nested child's rep/def levels belong to its
         // parent's rows and cannot be re-sliced here.
-        let inner =
-            self.inner
-                .create_field_encoder(self.inner.as_ref(), field, column_index, options)?;
+        let inner = self
+            .inner
+            .create_field_encoder(&self.inner, field, column_index, options)?;
         Ok(Box::new(ChunkingFieldEncoder {
             inner,
             chunk_bytes: self.chunk_bytes,
@@ -138,7 +141,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::encoder::default_encoding_strategy;
+    use crate::encoder::StructuralEncodingStrategy;
     use crate::version::LanceFileVersion;
 
     #[rstest]
@@ -158,9 +161,11 @@ mod tests {
 
     #[test]
     fn test_zero_chunk_bytes_rejected() {
-        let error =
-            ColumnChunkingStrategy::try_new(default_encoding_strategy(LanceFileVersion::V2_2), 0)
-                .unwrap_err();
+        let error = ColumnChunkingStrategy::try_new(
+            StructuralEncodingStrategy::with_version(LanceFileVersion::V2_2),
+            0,
+        )
+        .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(
             error

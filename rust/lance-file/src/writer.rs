@@ -1112,7 +1112,7 @@ mod tests {
     use lance_datagen::{ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_batch};
     use lance_encoding::compression_config::{CompressionFieldParams, CompressionParams};
     use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-    use lance_encoding::encoder::{ColumnChunkingStrategy, default_encoding_strategy};
+    use lance_encoding::encoder::{ColumnChunkingStrategy, StructuralEncodingStrategy};
     use lance_encoding::version::LanceFileVersion;
     use lance_io::object_store::ObjectStore;
     use lance_io::utils::CachedFileSize;
@@ -2399,9 +2399,11 @@ mod tests {
             .into_batch_rows(RowCount::from(64))
             .unwrap();
         let lance_schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
-        let strategy =
-            ColumnChunkingStrategy::try_new(default_encoding_strategy(version), 256 * 1024)
-                .unwrap();
+        let strategy = ColumnChunkingStrategy::try_new(
+            StructuralEncodingStrategy::with_version(version),
+            256 * 1024,
+        )
+        .unwrap();
         let options = FileWriterOptions {
             format_version: Some(version),
             encoding_strategy: Some(Arc::new(strategy)),
