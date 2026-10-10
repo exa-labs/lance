@@ -35,7 +35,7 @@ use lance_io::object_store::{
     LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
     StorageOptionsAccessor, StorageOptionsProvider,
 };
-use lance_io::utils::{read_last_block, read_message, read_metadata_offset, read_struct};
+use lance_io::utils::{read_last_block, read_message, read_metadata_offset};
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
     DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, RowIdMeta, pb,
@@ -47,7 +47,7 @@ use lance_table::io::commit::{
 };
 
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
-use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
+use lance_table::io::manifest::{manifest_message_body, read_manifest, read_manifest_indexes};
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -608,17 +608,24 @@ impl Dataset {
         let offset = read_metadata_offset(&last_block)?;
 
         // If manifest is in the last block, we can decode directly from memory.
+        // Otherwise read the bytes before the last block. Either way the
+        // message length comes from the footer, since its u32 prefix holds
+        // only the low 32 bits of the length.
         let manifest_size = object_reader.size().await?;
-        let mut manifest = if manifest_size - offset <= last_block.len() {
-            let manifest_len = manifest_size - offset;
-            let offset_in_block = last_block.len() - manifest_len;
-            let message_len =
-                LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
-            let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)
+        let manifest_len = manifest_size - offset;
+        let manifest_tail = if manifest_len <= last_block.len() {
+            last_block.slice(last_block.len() - manifest_len..)
         } else {
-            read_struct(object_reader.as_ref(), offset).await
-        }?;
+            let head = object_reader
+                .get_range(offset..manifest_size - last_block.len())
+                .await?;
+            let mut tail = bytes::BytesMut::with_capacity(manifest_len);
+            tail.extend_from_slice(&head);
+            tail.extend_from_slice(&last_block);
+            tail.freeze()
+        };
+        let message = manifest_message_body(manifest_tail)?;
+        let mut manifest = Manifest::try_from(lance_table::format::pb::Manifest::decode(message)?)?;
 
         if !can_read_dataset(manifest.reader_feature_flags) {
             let message = format!(

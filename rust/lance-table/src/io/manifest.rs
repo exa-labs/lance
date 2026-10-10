@@ -119,6 +119,31 @@ pub fn manifest_len_matches(recorded: u32, actual: usize) -> bool {
     actual as u32 == recorded
 }
 
+/// The body of the manifest message, given the bytes of a manifest file from
+/// the message's position (its u32 length prefix) to the end of the file.
+///
+/// The message runs up to the 16-byte footer, so its length is known from the
+/// layout; the prefix is checked against it with [`manifest_len_matches`].
+pub fn manifest_message_body(tail: Bytes) -> Result<Bytes> {
+    if tail.len() < 4 + 16 {
+        return Err(Error::invalid_input(format!(
+            "Invalid format: manifest message and footer take {} bytes, fewer than the 20 \
+             of a length prefix and footer",
+            tail.len()
+        )));
+    }
+    let recorded = LittleEndian::read_u32(&tail[..4]);
+    let body = tail.slice(4..tail.len() - 16);
+    if !manifest_len_matches(recorded, body.len()) {
+        return Err(Error::invalid_input(format!(
+            "Invalid format: manifest length does not match. Expected {} (mod 2^32), got {}",
+            recorded,
+            body.len()
+        )));
+    }
+    Ok(body)
+}
+
 #[instrument(level = "debug", skip(object_store, manifest))]
 pub async fn read_manifest_indexes(
     object_store: &ObjectStore,
