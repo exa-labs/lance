@@ -388,11 +388,12 @@ impl FileWriter {
             let encoded_page = encoding_task?;
             self.write_page(encoded_page).await?;
         }
-        // It's important to flush here, we don't know when the next batch will arrive
-        // and the underlying cloud store could have writes in progress that won't advance
-        // until we interact with the writer again.  These in-progress writes will time out
-        // if we don't flush.
-        self.writer.flush().await?;
+        // We don't know when the next batch will arrive, and the underlying cloud store
+        // could have a request in progress that won't advance until we interact with the
+        // writer again, so drive it here.  A full flush would also wait for every in-flight
+        // multipart part, which serializes uploads with encoding and caps a writer at one
+        // part in flight when each batch is smaller than a part.
+        self.writer.drive_in_flight_writes().await?;
         Ok(())
     }
 
@@ -1097,7 +1098,10 @@ impl EncodedBatchWriteExt for EncodedBatch {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::pin::Pin;
     use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
 
     use crate::reader::{FileReader, FileReaderOptions, ReaderProjection, describe_encoding};
     use crate::testing::FsFixture;
@@ -1106,6 +1110,7 @@ mod tests {
     use arrow_array::{ArrayRef, Int32Array, RecordBatch, UInt64Array};
     use arrow_array::{RecordBatchReader, StringArray, types::Float64Type};
     use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
+    use async_trait::async_trait;
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_core::utils::tempfile::TempObjFile;
@@ -1117,8 +1122,11 @@ mod tests {
     };
     use lance_encoding::version::LanceFileVersion;
     use lance_io::object_store::ObjectStore;
+    use lance_io::object_writer::WriteResult;
+    use lance_io::traits::Writer;
     use lance_io::utils::CachedFileSize;
     use rstest::rstest;
+    use tokio::io::AsyncWrite;
 
     #[tokio::test]
     async fn test_basic_write() {
@@ -1772,6 +1780,81 @@ mod tests {
         .unwrap();
         assert_eq!(reader.column_num_rows(0).unwrap(), 3);
         assert_eq!(reader.column_num_rows(1).unwrap(), 3);
+    }
+
+    /// A writer whose flush never completes, standing in for a store with
+    /// uploads still in flight that need no polling to finish.
+    struct PendingFlushWriter {
+        buf: Vec<u8>,
+    }
+
+    impl AsyncWrite for PendingFlushWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.buf.extend_from_slice(data);
+            Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[async_trait]
+    impl Writer for PendingFlushWriter {
+        async fn tell(&mut self) -> lance_core::Result<usize> {
+            Ok(self.buf.len())
+        }
+
+        async fn drive_in_flight_writes(&mut self) -> lance_core::Result<()> {
+            Ok(())
+        }
+
+        async fn shutdown(&mut self) -> lance_core::Result<WriteResult> {
+            Ok(WriteResult {
+                size: self.buf.len(),
+                e_tag: None,
+            })
+        }
+    }
+
+    /// `write_batch` must not wait for in-flight writes to finish, only drive
+    /// them, so uploads overlap with encoding the next batch.
+    #[tokio::test]
+    async fn test_write_batch_does_not_wait_for_in_flight_writes() {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            true,
+        )]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+        let mut writer = FileWriter::try_new(
+            Box::new(PendingFlushWriter { buf: Vec::new() }),
+            lance_schema,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(Int32Array::from_iter_values(0..1024))],
+        )
+        .unwrap();
+
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_secs(30), writer.write_batch(&batch))
+                .await
+                .expect("write_batch waited for in-flight writes")
+                .unwrap();
+        }
+        let summary = writer.finish().await.unwrap();
+        assert_eq!(summary.num_rows, 3 * 1024);
     }
 
     #[tokio::test]
