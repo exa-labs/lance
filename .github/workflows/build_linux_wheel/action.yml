@@ -1,4 +1,6 @@
 # We create a composite action to be re-used both for testing and for releasing
+# sccache uses the GitHub Actions cache backend; runs reuse caches written by
+# the same branch or by the default branch.
 name: build-linux-wheel
 description: "Build a manylinux wheel for lance"
 inputs:
@@ -40,6 +42,7 @@ runs:
         manylinux: ${{ inputs.manylinux }}
         args: ${{ inputs.args }}
         maturin-version: "1.10.2"
+        sccache: "true"
         before-script-linux: |
           set -e
           yum install -y openssl-devel \
@@ -59,6 +62,7 @@ runs:
           -e CXX=clang++
         args: ${{ inputs.args }}
         maturin-version: "1.10.2"
+        sccache: "true"
         before-script-linux: |
           set -e
           yum install -y openssl-devel clang \
@@ -75,6 +79,7 @@ runs:
         manylinux: ${{ inputs.manylinux }}
         args: ${{ inputs.args }}
         maturin-version: "1.10.2"
+        sccache: "true"
         before-script-linux: |
           set -e
           yum install -y openssl-devel clang \
