@@ -670,6 +670,17 @@ fn is_multipart_upload_request(request: &HttpRequest) -> bool {
     })
 }
 
+/// Whether a lowercased multipart-complete response body carries an S3-style
+/// `InternalError` payload. S3 can answer `CompleteMultipartUpload` with HTTP
+/// 200 and an error document; the tag may carry a namespace or attributes, so
+/// the match is on the opening-tag prefix rather than the exact `<error>`
+/// element. The success body (`<CompleteMultipartUploadResult>`) contains
+/// neither marker.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+fn is_retryable_complete_error_body(body: &str) -> bool {
+    body.contains("<error") && body.contains("internalerror")
+}
+
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 fn is_retryable_http_error(error: &HttpError) -> bool {
     matches!(
@@ -720,11 +731,10 @@ impl HttpService for AimdMultipartUploadService {
                         is_retryable |= is_throttle_body;
                         is_throttle |= is_throttle_body;
                         // S3 can answer a complete with HTTP 200 carrying an
-                        // <Error><Code>InternalError</Code> body. Retrying is
-                        // safe: the request already holds the serialized part
-                        // list, so re-sending it repeats the exact completion.
-                        if is_complete && body.contains("<error>") && body.contains("internalerror")
-                        {
+                        // error body. Retrying is safe: the request already
+                        // holds the serialized part list, so re-sending it
+                        // repeats the exact completion.
+                        if is_complete && is_retryable_complete_error_body(&body) {
                             is_retryable = true;
                         }
                         Ok(HttpResponse::from_parts(
@@ -1117,6 +1127,25 @@ mod tests {
             .body(object_store::client::HttpRequestBody::empty())
             .unwrap();
         assert_eq!(is_multipart_upload_request(&request), expected);
+    }
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    #[rstest]
+    #[case::plain_internal_error(
+        "<error><code>internalerror</code><message>internal error</message></error>",
+        true
+    )]
+    #[case::namespaced_internal_error(
+        "<error xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><code>internalerror</code></error>",
+        true
+    )]
+    #[case::success_result(
+        "<?xml version=\"1.0\"?><completemultipartuploadresult><etag>\"e\"</etag></completemultipartuploadresult>",
+        false
+    )]
+    #[case::other_error("<error><code>accessdenied</code></error>", false)]
+    fn test_is_retryable_complete_error_body(#[case] body: &str, #[case] expected: bool) {
+        assert_eq!(is_retryable_complete_error_body(body), expected);
     }
 
     #[tokio::test]
@@ -1997,6 +2026,7 @@ mod tests {
         part_uris: std::sync::Mutex<Vec<String>>,
         complete_failures_remaining: AtomicUsize,
         complete_calls: AtomicUsize,
+        complete_error_on_200: bool,
     }
 
     #[cfg(feature = "aws")]
@@ -2086,11 +2116,19 @@ mod tests {
                     }
                 };
                 if should_fail {
-                    (
-                        ::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>",
-                        None,
-                    )
+                    if self.state.complete_error_on_200 {
+                        (
+                            ::http::StatusCode::OK,
+                            "<Error xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Code>InternalError</Code><Message>We encountered an internal error. Please try again.</Message></Error>",
+                            None,
+                        )
+                    } else {
+                        (
+                            ::http::StatusCode::SERVICE_UNAVAILABLE,
+                            "<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>",
+                            None,
+                        )
+                    }
                 } else {
                     (
                         ::http::StatusCode::OK,
@@ -2126,6 +2164,7 @@ mod tests {
             part_uris: std::sync::Mutex::new(Vec::new()),
             complete_failures_remaining: AtomicUsize::new(0),
             complete_calls: AtomicUsize::new(0),
+            complete_error_on_200: false,
         });
         let throttle_state = AimdThrottleState::new(AimdThrottleConfig::default()).unwrap();
         let connector = AimdMultipartUploadConnector::new(
@@ -2173,6 +2212,7 @@ mod tests {
             part_uris: std::sync::Mutex::new(Vec::new()),
             complete_failures_remaining: AtomicUsize::new(1),
             complete_calls: AtomicUsize::new(0),
+            complete_error_on_200: false,
         });
         let throttle_state = AimdThrottleState::new(AimdThrottleConfig::default()).unwrap();
         let connector = AimdMultipartUploadConnector::new(
@@ -2204,6 +2244,55 @@ mod tests {
             retry_state.complete_calls.load(Ordering::SeqCst),
             2,
             "the throttled complete should be retried exactly once at the HTTP layer"
+        );
+    }
+
+    /// S3 can answer `CompleteMultipartUpload` with HTTP 200 and an
+    /// `InternalError` error document; the HTTP layer must retry that body
+    /// variant too.
+    #[cfg(feature = "aws")]
+    #[tokio::test(start_paused = true)]
+    async fn test_multipart_http_retry_recovers_200_internal_error_complete() {
+        use object_store::RetryConfig;
+        use object_store::aws::AmazonS3Builder;
+
+        let retry_state = Arc::new(MultipartRetryState {
+            failures_remaining: AtomicUsize::new(0),
+            part_uris: std::sync::Mutex::new(Vec::new()),
+            complete_failures_remaining: AtomicUsize::new(1),
+            complete_calls: AtomicUsize::new(0),
+            complete_error_on_200: true,
+        });
+        let throttle_state = AimdThrottleState::new(AimdThrottleConfig::default()).unwrap();
+        let connector = AimdMultipartUploadConnector::new(
+            MultipartRetryConnector {
+                state: Arc::clone(&retry_state),
+            },
+            Some(&throttle_state),
+        );
+        let store = AmazonS3Builder::new()
+            .with_bucket_name("bucket")
+            .with_region("us-east-1")
+            .with_skip_signature(true)
+            .with_retry(RetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            })
+            .with_http_connector(connector)
+            .build()
+            .unwrap();
+
+        let mut upload = store.put_multipart(&Path::from("object")).await.unwrap();
+        upload
+            .put_part(PutPayload::from_static(b"payload"))
+            .await
+            .unwrap();
+        upload.complete().await.unwrap();
+
+        assert_eq!(
+            retry_state.complete_calls.load(Ordering::SeqCst),
+            2,
+            "a 200 InternalError complete should be retried once at the HTTP layer"
         );
     }
 
