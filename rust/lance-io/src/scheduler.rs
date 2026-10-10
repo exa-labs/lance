@@ -330,6 +330,20 @@ impl IoQueue {
 
     async fn pop(&self) -> Option<IoTask> {
         loop {
+            // Wait for a request before touching the global quota, so an
+            // idle scheduler does not fix the process-wide limit (see
+            // `set_default_process_iops_limit`) before any I/O.
+            let idle = {
+                let state = self.state.lock().unwrap();
+                if state.pending_requests.is_empty() && state.done_scheduling {
+                    return None;
+                }
+                state.pending_requests.is_empty()
+            };
+            if idle {
+                self.notify.notified().await;
+                continue;
+            }
             {
                 // First, grab a reservation on the global IOPS quota
                 // If we then get a task to run, transfer the reservation
