@@ -1,0 +1,16 @@
+source_commit=1aa82f9e26f7d75d77cbe69023d3cfa707615223
+source_date_epoch=1791618137
+target=x86_64-unknown-linux-gnu
+zig_archive_sha256=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+maturin_archive_sha256=5a7d5226e83598b0c85881a0a03be16393ee2c0924b6f9d752951795825ac806
+protoc_archive_sha256=5871398dfd6ac954a6adebf41f1ae3a4de915a36a6ab2fd3e8f2c00d45b50dec
+rustc 1.91.0 (f8297e351 2025-10-28)
+binary: rustc
+commit-hash: f8297e351a40c1439a467bbbb6879088047f50b3
+commit-date: 2025-10-28
+host: x86_64-unknown-linux-gnu
+release: 1.91.0
+LLVM version: 21.1.2
+zig_version=0.16.0
+maturin_version=maturin 1.15.0
+wheel_sha256=bd8fe5716d9c8e17078481ad7739b921243a597d7655974ef08326ebfaa9e09e
