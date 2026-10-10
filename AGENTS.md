@@ -20,10 +20,12 @@ Rust workspace with Python and Java bindings:
 - `rust/lance-geo/` - Geospatial data support
 - `rust/lance-datagen/` - Data generation for tests and benchmarks
 - `rust/lance-namespace/` / `rust/lance-namespace-impls/` - Namespace/catalog interfaces
+- `rust/lance-namespace-datafusion/` - Namespace integration with DataFusion catalogs and schemas
 - `rust/lance-test-macros/` / `rust/lance-testing/` - Test infrastructure
 - `rust/lance-tools/` - CLI and developer tooling
 - `rust/examples/` - Sample binaries and demonstrations
 - `rust/compression/bitpacking/` / `rust/compression/fsst/` - Compression codecs
+- `rust/arrow-scalar/` - Arrow scalar type with `Ord`, `Hash`, and `Eq` support
 - `rust/lance-datafusion/` - DataFusion integration (built separately)
 - `python/` - Python bindings (PyO3/maturin)
 - `java/` - Java bindings (JNI)
