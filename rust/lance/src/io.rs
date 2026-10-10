@@ -13,5 +13,6 @@ pub use lance_io::{
         ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor,
         WrappingObjectStore,
     },
+    set_default_process_iops_limit,
     stream::RecordBatchStream,
 };

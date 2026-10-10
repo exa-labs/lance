@@ -11,7 +11,7 @@ use std::future::Future;
 use std::num::NonZero;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 
@@ -45,6 +45,36 @@ static BYTES_READ_COUNTER: AtomicU64 = AtomicU64::new(0);
 // Note: this only limits things that run through the scheduler.  It does not limit
 // IOPS from other sources like writing or commits.
 static DEFAULT_PROCESS_IOPS_LIMIT: i32 = 128;
+
+// The process-wide limit an application chose with
+// `set_default_process_iops_limit`.  Frozen (to the built-in default when the
+// application set nothing) the first time a scheduler issues I/O.
+static APPLICATION_PROCESS_IOPS_LIMIT: OnceLock<i32> = OnceLock::new();
+
+/// Sets the process-wide limit on concurrent scheduler IOPS used when the
+/// `LANCE_PROCESS_IO_THREADS_LIMIT` environment variable is unset, so an
+/// application can size it for its host instead of the conservative built-in
+/// default (128).  Zero or a negative value removes the limit.
+///
+/// The limit is fixed the first time a scheduler issues I/O.  Returns `false`,
+/// and has no effect, when that has already happened or a limit was already
+/// set.
+pub fn set_default_process_iops_limit(limit: i32) -> bool {
+    APPLICATION_PROCESS_IOPS_LIMIT.set(limit).is_ok()
+}
+
+/// The process-wide IOPS limit: the `LANCE_PROCESS_IO_THREADS_LIMIT` value
+/// when it is set and valid, else `default_limit`.
+fn resolve_process_iops_limit(env_value: Option<String>, default_limit: i32) -> i32 {
+    env_value
+        .map(|s| {
+            s.parse::<i32>().unwrap_or_else(|_| {
+                log::warn!("Ignoring invalid LANCE_PROCESS_IO_THREADS_LIMIT: {}", s);
+                default_limit
+            })
+        })
+        .unwrap_or(default_limit)
+}
 
 pub fn iops_counter() -> u64 {
     IOPS_COUNTER.load(Ordering::Acquire)
@@ -108,14 +138,12 @@ impl IopsQuota {
     // However, the user can disable this by setting the environment variable
     // LANCE_PROCESS_IO_THREADS_LIMIT to zero (or a negative integer).
     fn new() -> Self {
-        let initial_capacity = std::env::var("LANCE_PROCESS_IO_THREADS_LIMIT")
-            .map(|s| {
-                s.parse::<i32>().unwrap_or_else(|_| {
-                    log::warn!("Ignoring invalid LANCE_PROCESS_IO_THREADS_LIMIT: {}", s);
-                    DEFAULT_PROCESS_IOPS_LIMIT
-                })
-            })
-            .unwrap_or(DEFAULT_PROCESS_IOPS_LIMIT);
+        let default_limit =
+            *APPLICATION_PROCESS_IOPS_LIMIT.get_or_init(|| DEFAULT_PROCESS_IOPS_LIMIT);
+        let initial_capacity = resolve_process_iops_limit(
+            std::env::var("LANCE_PROCESS_IO_THREADS_LIMIT").ok(),
+            default_limit,
+        );
         let iops_avail = if initial_capacity <= 0 {
             None
         } else {
@@ -302,6 +330,20 @@ impl IoQueue {
 
     async fn pop(&self) -> Option<IoTask> {
         loop {
+            // Wait for a request before touching the global quota, so an
+            // idle scheduler does not fix the process-wide limit (see
+            // `set_default_process_iops_limit`) before any I/O.
+            let idle = {
+                let state = self.state.lock().unwrap();
+                if state.pending_requests.is_empty() && state.done_scheduling {
+                    return None;
+                }
+                state.pending_requests.is_empty()
+            };
+            if idle {
+                self.notify.notified().await;
+                continue;
+            }
             {
                 // First, grab a reservation on the global IOPS quota
                 // If we then get a task to run, transfer the reservation
@@ -1064,6 +1106,18 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn test_resolve_process_iops_limit() {
+        assert_eq!(resolve_process_iops_limit(None, 512), 512);
+        assert_eq!(resolve_process_iops_limit(Some("64".to_string()), 512), 64);
+        assert_eq!(resolve_process_iops_limit(Some("0".to_string()), 512), 0);
+        assert_eq!(resolve_process_iops_limit(Some("-1".to_string()), 512), -1);
+        assert_eq!(
+            resolve_process_iops_limit(Some("many".to_string()), 512),
+            512
+        );
+    }
 
     #[tokio::test]
     async fn test_full_seq_read() {

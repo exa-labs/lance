@@ -23,7 +23,7 @@ pub mod testing;
 pub mod traits;
 pub mod utils;
 
-pub use scheduler::{bytes_read_counter, iops_counter};
+pub use scheduler::{bytes_read_counter, iops_counter, set_default_process_iops_limit};
 
 /// Defines a selection of rows to read from a file/batch
 #[derive(Debug, Clone, PartialEq, Default)]
