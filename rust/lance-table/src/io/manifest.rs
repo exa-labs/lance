@@ -132,13 +132,13 @@ pub async fn read_manifest(
         buf2.freeze()
     };
 
-    let recorded_length = LittleEndian::read_u32(&buf[0..4]) as usize;
+    let recorded_length = LittleEndian::read_u32(&buf[0..4]);
     // Need to trim the magic number at end and message length at beginning
     let buf = buf.slice(4..buf.len() - 16);
 
-    if buf.len() != recorded_length {
+    if !manifest_len_matches(recorded_length, buf.len()) {
         return Err(Error::invalid_input(format!(
-            "Invalid format: manifest length does not match. Expected {}, got {}",
+            "Invalid format: manifest length does not match. Expected {} (mod 2^32), got {}",
             recorded_length,
             buf.len()
         )));
@@ -146,6 +146,18 @@ pub async fn read_manifest(
 
     let proto = pb::Manifest::decode(buf)?;
     Manifest::try_from(proto)
+}
+
+/// Whether `recorded`, the manifest message's u32 length prefix, is valid for
+/// a message of `actual` bytes.
+///
+/// The message length comes from the file layout (footer position to end of
+/// file). Writers that support manifests over [`u32::MAX`] bytes store only
+/// the low 32 bits of the length in the prefix, so the prefix is checked
+/// modulo 2^32; any other mismatch means the file is corrupt.
+pub fn manifest_len_matches(recorded: u32, actual: usize) -> bool {
+    // Truncation intended: compare the low 32 bits.
+    actual as u32 == recorded
 }
 
 #[instrument(level = "debug", skip(object_store, manifest))]
@@ -288,6 +300,54 @@ mod test {
     use tokio::io::AsyncWriteExt;
 
     use super::*;
+
+    #[test]
+    fn manifest_len_prefix_is_checked_mod_u32() {
+        assert!(manifest_len_matches(0, 0));
+        assert!(manifest_len_matches(1234, 1234));
+        assert!(manifest_len_matches(u32::MAX, u32::MAX as usize));
+        assert!(!manifest_len_matches(1233, 1234));
+        #[cfg(target_pointer_width = "64")]
+        {
+            let wrapped = (1usize << 32) + 527;
+            assert!(manifest_len_matches(527, wrapped));
+            assert!(!manifest_len_matches(526, wrapped));
+        }
+    }
+
+    #[tokio::test]
+    async fn read_manifest_rejects_a_mismatched_len_prefix() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/bad_len_prefix");
+        let mut writer = store.create(&path).await.unwrap();
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("a", DataType::Int64, false)]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        let pos = write_manifest(writer.as_mut(), &mut manifest, None, None)
+            .await
+            .unwrap();
+        writer
+            .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+            .await
+            .unwrap();
+        Writer::shutdown(writer.as_mut()).await.unwrap();
+
+        let mut bytes = store.read_one_all(&path).await.unwrap().to_vec();
+        let recorded = LittleEndian::read_u32(&bytes[pos..pos + 4]);
+        LittleEndian::write_u32(&mut bytes[pos..pos + 4], recorded + 1);
+        store.put(&path, &bytes).await.unwrap();
+
+        let err = read_manifest(&store, &path, None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("manifest length does not match"),
+            "{err}"
+        );
+    }
 
     async fn test_roundtrip_manifest(prefix_size: usize, manifest_min_size: usize) {
         let store = ObjectStore::memory();
