@@ -155,16 +155,16 @@ pub fn manifest_message_body(tail: Bytes) -> Result<Bytes> {
 /// of a manifest file.
 ///
 /// `next_section` is the position of the section written right after it, if
-/// any; otherwise the manifest message follows it, at the position the footer
-/// records.
+/// any; otherwise the manifest message follows it. Its position is confirmed
+/// from the first block when that block holds the u32 just past the message
+/// and that u32 is a valid manifest prefix for the reader's size (see
+/// [`confirmed_manifest_position`]), the common case of a small section. Only
+/// otherwise is it read from the footer, which may take one more request.
 ///
-/// The length is taken from the u32 prefix whenever the rest of the file is
-/// too short for the true length to be 2^32 or more bytes longer. Otherwise
-/// the length is the distance to the next section, checked against the prefix
-/// with [`section_len_matches`].
-///
-/// Fails with "file size is too small" when `reader`'s size ends before the
-/// message does, as a stale cached size would.
+/// See [`section_message_len`] for how the length is chosen. Fails with
+/// "file size is too small" when `reader`'s size ends before the message or
+/// does not end at a footer, as a stale cached size would, so callers can retry
+/// with the true size.
 pub async fn read_section_message<M: Message + Default>(
     reader: &dyn Reader,
     pos: usize,
@@ -177,7 +177,20 @@ pub async fn read_section_message<M: Message + Default>(
     let first = pos..file_size.min(pos + reader.block_size());
     let buf = reader.get_range(first.clone()).await?;
     let recorded = LittleEndian::read_u32(&buf);
-    let len = section_message_len(reader, pos, file_size, recorded, next_section).await?;
+    // A manifest message (at least its prefix) and the footer follow every section.
+    let room = file_size.saturating_sub(pos + LEN_PREFIX_LEN + LEN_PREFIX_LEN + FOOTER_LEN);
+    let layout_end = match next_section.filter(|&next| next > pos) {
+        Some(next) => next,
+        None => match confirmed_manifest_position(&buf, pos, recorded, file_size, room) {
+            Some(manifest_pos) => manifest_pos,
+            None if first.end == file_size => manifest_position_from_footer(&buf)?,
+            None => {
+                let footer = file_size - FOOTER_LEN.min(file_size)..file_size;
+                manifest_position_from_footer(&reader.get_range(footer).await?)?
+            }
+        },
+    };
+    let len = section_message_len(pos, recorded, layout_end, room)?;
 
     let end = pos + LEN_PREFIX_LEN + len;
     if end > file_size {
@@ -195,36 +208,29 @@ pub async fn read_section_message<M: Message + Default>(
     Ok(M::decode(&buf[LEN_PREFIX_LEN..LEN_PREFIX_LEN + len])?)
 }
 
-/// The length of the section message at `pos` whose u32 prefix is `recorded`;
-/// see [`read_section_message`].
-async fn section_message_len(
-    reader: &dyn Reader,
-    pos: usize,
-    file_size: usize,
-    recorded: u32,
-    next_section: Option<usize>,
-) -> Result<usize> {
-    // A manifest message (at least its prefix) and the footer follow every section.
-    let room = file_size.saturating_sub(pos + LEN_PREFIX_LEN + LEN_PREFIX_LEN + FOOTER_LEN);
-    if !may_exceed_u32_prefix(recorded, room) {
-        return Ok(recorded as usize);
+/// The length of the section message at `pos` whose u32 prefix is
+/// `recorded`, given `layout_end`, where the file layout says the section
+/// ends (the next section's position), and `room`, the most bytes the
+/// message can take before the end of the reader.
+///
+/// - The distance to `layout_end` when the prefix matches it modulo 2^32
+///   ([`section_len_matches`]). It is used even when it exceeds `room`, so a
+///   stale reader size fails as too small instead of yielding a message cut at
+///   the wrapped length.
+/// - Otherwise the prefix, when `room` is too small for the true length to be
+///   2^32 or more bytes longer: files whose sections are not laid out back to
+///   back are read as before.
+/// - Otherwise an error: the length is ambiguous and the layout disagrees.
+fn section_message_len(pos: usize, recorded: u32, layout_end: usize, room: usize) -> Result<usize> {
+    let layout_len = layout_end.checked_sub(pos + LEN_PREFIX_LEN);
+    match layout_len {
+        Some(len) if section_len_matches(recorded, len) => Ok(len),
+        _ if !may_exceed_u32_prefix(recorded, room) => Ok(recorded as usize),
+        _ => Err(Error::invalid_input(format!(
+            "Invalid format: section length does not match. The section at {pos} ends at \
+             {layout_end}, but its length prefix is {recorded} (mod 2^32)"
+        ))),
     }
-    let end = match next_section.filter(|&next| next > pos) {
-        Some(next) => next,
-        None => read_manifest_position(reader, file_size).await?,
-    };
-    let actual = end.checked_sub(pos + LEN_PREFIX_LEN).ok_or_else(|| {
-        Error::invalid_input(format!(
-            "Invalid format: section at {pos} ends at {end}, before its length prefix does"
-        ))
-    })?;
-    if !section_len_matches(recorded, actual) {
-        return Err(Error::invalid_input(format!(
-            "Invalid format: section length does not match. Expected {recorded} (mod 2^32), \
-             got {actual}"
-        )));
-    }
-    Ok(actual)
 }
 
 /// Whether a message with u32 prefix `recorded` and at most `room` bytes could
@@ -233,19 +239,46 @@ fn may_exceed_u32_prefix(recorded: u32, room: usize) -> bool {
     (recorded as u64) + (1u64 << 32) <= room as u64
 }
 
-/// The manifest message's position, read from the footer at the end of a
-/// manifest file of `file_size` bytes.
-async fn read_manifest_position(reader: &dyn Reader, file_size: usize) -> Result<usize> {
-    let footer = reader
-        .get_range(file_size.saturating_sub(FOOTER_LEN)..file_size)
-        .await?;
-    if footer.len() < FOOTER_LEN || !footer.ends_with(MAGIC) {
+/// The position of the manifest message after the section at `pos`, when
+/// `first`, the bytes read from `pos`, confirms it without the footer.
+///
+/// The prefix `recorded` must be unambiguous for the reader's `room`, and the
+/// u32 just past the message it describes must be a valid prefix for a
+/// manifest message running from there to a footer at `file_size`. A stale
+/// reader size, or a wrapped prefix read against one, fails that check except
+/// by a 2^-32 coincidence; the caller then reads the footer.
+fn confirmed_manifest_position(
+    first: &[u8],
+    pos: usize,
+    recorded: u32,
+    file_size: usize,
+    room: usize,
+) -> Option<usize> {
+    if may_exceed_u32_prefix(recorded, room) {
+        return None;
+    }
+    let offset = LEN_PREFIX_LEN + recorded as usize;
+    let manifest_prefix = first.get(offset..offset + LEN_PREFIX_LEN)?;
+    let manifest_pos = pos + offset;
+    let manifest_len = file_size.checked_sub(manifest_pos + LEN_PREFIX_LEN + FOOTER_LEN)?;
+    section_len_matches(LittleEndian::read_u32(manifest_prefix), manifest_len)
+        .then_some(manifest_pos)
+}
+
+/// The manifest message's position, read from `tail`, bytes that end where
+/// the reader ends.
+///
+/// Missing magic means the reader does not end at the footer, as with a stale
+/// cached size, and is reported as a too-small file size.
+fn manifest_position_from_footer(tail: &[u8]) -> Result<usize> {
+    if tail.len() < FOOTER_LEN || !tail.ends_with(MAGIC) {
         return Err(Error::io(
             "manifest footer not found at the end of the reader: file size is too small or the \
              file is corrupt"
                 .to_string(),
         ));
     }
+    let footer = &tail[tail.len() - FOOTER_LEN..];
     Ok(LittleEndian::read_i64(&footer[..8]) as usize)
 }
 
@@ -1003,6 +1036,68 @@ mod test {
         assert!(!may_exceed_u32_prefix(u32::MAX, (2usize << 32) - 2));
     }
 
+    #[test]
+    fn test_confirmed_manifest_position() {
+        // A 10 byte section at 100 followed by a 30 byte manifest message.
+        let mut first = vec![0u8; LEN_PREFIX_LEN + 10 + LEN_PREFIX_LEN];
+        first[..4].copy_from_slice(&10u32.to_le_bytes());
+        first[14..18].copy_from_slice(&30u32.to_le_bytes());
+        let file_size = 100 + 14 + LEN_PREFIX_LEN + 30 + FOOTER_LEN;
+        let room = file_size - 100 - 24;
+        assert_eq!(
+            confirmed_manifest_position(&first, 100, 10, file_size, room),
+            Some(114)
+        );
+        // A reader size that does not end at the footer: not confirmed.
+        assert_eq!(
+            confirmed_manifest_position(&first, 100, 10, file_size - 1, room - 1),
+            None
+        );
+        assert_eq!(confirmed_manifest_position(&first, 100, 10, 120, 0), None);
+        // The u32 past the message was not read.
+        assert_eq!(
+            confirmed_manifest_position(&first[..17], 100, 10, file_size, room),
+            None
+        );
+        // A prefix that may be wrapped is never confirmed from the first block.
+        assert_eq!(
+            confirmed_manifest_position(&first, 100, 10, file_size, 1usize << 33),
+            None
+        );
+    }
+
+    #[test]
+    fn test_section_message_len() {
+        // Back to back with the next section: the layout length.
+        assert_eq!(section_message_len(100, 50, 154, 1000).unwrap(), 50);
+        // Sections not laid out back to back are read by their prefix while the
+        // length cannot be ambiguous.
+        assert_eq!(section_message_len(100, 50, 400, 1000).unwrap(), 50);
+        assert_eq!(section_message_len(100, 50, 50, 1000).unwrap(), 50);
+
+        // A wrapped prefix with the layout agreeing modulo 2^32.
+        let wrapped_end = 104 + (1usize << 32) + 50;
+        assert_eq!(
+            section_message_len(100, 50, wrapped_end, 1usize << 33).unwrap(),
+            (1usize << 32) + 50
+        );
+        // The same with a stale reader size: the layout length still wins, so
+        // the read fails as too small instead of decoding a cut message.
+        assert_eq!(
+            section_message_len(0, 0, LEN_PREFIX_LEN + (1usize << 32), 8192).unwrap(),
+            1usize << 32
+        );
+
+        // Ambiguous and the layout disagrees.
+        let err = section_message_len(100, 50, wrapped_end - 1, 1usize << 33)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("section length does not match"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// A manifest file tail: `prefix`, `body_len` zero bytes, then a footer.
     fn manifest_tail(prefix: u32, body_len: usize) -> Bytes {
         let mut tail = vec![0u8; LEN_PREFIX_LEN + body_len + FOOTER_LEN];
@@ -1097,17 +1192,19 @@ mod test {
         assert_eq!(read_transaction, transaction);
 
         // A reader whose size ends inside the message reports a too-small size.
-        let short = store
-            .open_with_size(&path, transaction_pos + LEN_PREFIX_LEN + 1)
-            .await
-            .unwrap();
-        let err = read_section_message::<pb::Transaction>(short.as_ref(), transaction_pos, None)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("file size is too small"),
-            "unexpected error: {err}"
-        );
+        // So does one that ends past the message but before the footer.
+        let manifest_pos = transaction_pos + LEN_PREFIX_LEN + transaction.encoded_len();
+        for size in [transaction_pos + LEN_PREFIX_LEN + 1, manifest_pos + 8] {
+            let short = store.open_with_size(&path, size).await.unwrap();
+            let err =
+                read_section_message::<pb::Transaction>(short.as_ref(), transaction_pos, None)
+                    .await
+                    .unwrap_err();
+            assert!(
+                err.to_string().contains("file size is too small"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     /// Append `message` followed by an unknown length-delimited field of
