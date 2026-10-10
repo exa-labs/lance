@@ -7,6 +7,7 @@
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
+use bytes::BytesMut;
 use chrono::{Duration, prelude::*};
 use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
@@ -37,9 +38,7 @@ use lance_io::object_store::{
     WrappingObjectStore,
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_io::utils::{
-    CachedFileSize, read_last_block, read_message, read_metadata_offset, read_struct,
-};
+use lance_io::utils::{CachedFileSize, read_last_block, read_metadata_offset};
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
     DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest, RowIdMeta,
@@ -52,7 +51,9 @@ use lance_table::io::commit::{
 };
 
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
-use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
+use lance_table::io::manifest::{
+    manifest_message_body, read_manifest, read_manifest_indexes, read_section_message,
+};
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
@@ -704,17 +705,24 @@ impl Dataset {
         let offset = read_metadata_offset(&last_block)?;
 
         // If manifest is in the last block, we can decode directly from memory.
+        // Otherwise read the bytes before the last block. Either way the
+        // message length comes from the footer, since its u32 prefix holds
+        // only the low 32 bits of the length.
         let manifest_size = object_reader.size().await?;
-        let mut manifest = if manifest_size - offset <= last_block.len() {
-            let manifest_len = manifest_size - offset;
-            let offset_in_block = last_block.len() - manifest_len;
-            let message_len =
-                LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
-            let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)
+        let manifest_len = manifest_size - offset;
+        let manifest_tail = if manifest_len <= last_block.len() {
+            last_block.slice(last_block.len() - manifest_len..)
         } else {
-            read_struct(object_reader.as_ref(), offset).await
-        }?;
+            let head = object_reader
+                .get_range(offset..manifest_size - last_block.len())
+                .await?;
+            let mut tail = BytesMut::with_capacity(manifest_len);
+            tail.extend_from_slice(&head);
+            tail.extend_from_slice(&last_block);
+            tail.freeze()
+        };
+        let message = manifest_message_body(manifest_tail)?;
+        let mut manifest = Manifest::try_from(lance_table::format::pb::Manifest::decode(message)?)?;
 
         if !can_read_dataset(manifest.reader_feature_flags) {
             let message = format!(
@@ -1239,14 +1247,15 @@ impl Dataset {
             };
 
             // A concurrent overwrite can leave the listed size too small; retry
-            // once with the true size.
-            let tx: pb::Transaction = match read_message(reader.as_ref(), pos).await {
+            // once with the true size. The inline transaction is the last
+            // section before the manifest message.
+            let tx: pb::Transaction = match read_section_message(reader.as_ref(), pos, None).await {
                 Err(e)
                     if manifest_location.size.is_some()
                         && e.to_string().contains("file size is too small") =>
                 {
                     let reader = self.object_store.open(&manifest_location.path).await?;
-                    read_message(reader.as_ref(), pos).await?
+                    read_section_message(reader.as_ref(), pos, None).await?
                 }
                 other => other?,
             };

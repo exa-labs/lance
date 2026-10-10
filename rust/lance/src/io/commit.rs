@@ -37,6 +37,7 @@ use lance_table::format::{
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
+use lance_table::io::manifest::read_section_message;
 use rand::{Rng, rng};
 
 use super::ObjectStore;
@@ -194,8 +195,12 @@ async fn do_commit_new_dataset(
 
             let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
                 let reader = object_store.open(&source_manifest_location.path).await?;
-                let section: pb::IndexSection =
-                    lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
+                let section: pb::IndexSection = read_section_message(
+                    reader.as_ref(),
+                    index_section_pos,
+                    source_manifest.transaction_section,
+                )
+                .await?;
                 section
                     .indices
                     .into_iter()
@@ -231,8 +236,12 @@ async fn do_commit_new_dataset(
             let mut updated_indices = Vec::new();
             if let Some(index_section_pos) = source_manifest.index_section {
                 let reader = object_store.open(&source_manifest_location.path).await?;
-                let section: pb::IndexSection =
-                    lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
+                let section: pb::IndexSection = read_section_message(
+                    reader.as_ref(),
+                    index_section_pos,
+                    source_manifest.transaction_section,
+                )
+                .await?;
                 updated_indices = section
                     .indices
                     .into_iter()
