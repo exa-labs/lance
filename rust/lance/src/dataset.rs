@@ -569,7 +569,7 @@ impl Dataset {
             self.object_store.clone(),
             new_location.path,
             new_location.uri,
-            Arc::new(manifest),
+            manifest,
             manifest_location,
             self.session.clone(),
             self.commit_handler.clone(),
@@ -583,7 +583,16 @@ impl Dataset {
         manifest_location: &ManifestLocation,
         uri: &str,
         session: &Session,
-    ) -> Result<Manifest> {
+    ) -> Result<Arc<Manifest>> {
+        let metadata_cache = session.metadata_cache.for_dataset(uri);
+        let manifest_key = ManifestKey {
+            version: manifest_location.version,
+            e_tag: manifest_location.e_tag.as_deref(),
+        };
+        if let Some(cached) = metadata_cache.get_with_key(&manifest_key).await {
+            return Ok(cached);
+        }
+
         let object_reader = if let Some(size) = manifest_location.size {
             object_store
                 .open_with_size(&manifest_location.path, size as usize)
@@ -679,6 +688,10 @@ impl Dataset {
             populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
         }
 
+        let manifest = Arc::new(manifest);
+        metadata_cache
+            .insert_with_key(&manifest_key, manifest.clone())
+            .await;
         Ok(manifest)
     }
 
@@ -2418,20 +2431,13 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 {
                     cached
                 } else {
-                    let loaded = Arc::new(
-                        Dataset::load_manifest(
-                            dataset.object_store(),
-                            &location,
-                            &dataset.uri,
-                            dataset.session.as_ref(),
-                        )
-                        .await?,
-                    );
-                    dataset
-                        .metadata_cache
-                        .insert_with_key(&manifest_key, loaded.clone())
-                        .await;
-                    loaded
+                    Dataset::load_manifest(
+                        dataset.object_store(),
+                        &location,
+                        &dataset.uri,
+                        dataset.session.as_ref(),
+                    )
+                    .await?
                 };
 
                 if let Some(latest_tx) = latest_tx {

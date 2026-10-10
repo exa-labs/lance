@@ -229,6 +229,40 @@ async fn test_restore(
 
 #[rstest]
 #[tokio::test]
+async fn test_checkout_version_uses_manifest_cache(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::UInt32,
+        false,
+    )]));
+    let test_uri = TempStrDir::default();
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from_iter_values(0..100))],
+    );
+    let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
+    let dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let first = dataset.checkout_version(1).await.unwrap();
+    let second = dataset.checkout_version(1).await.unwrap();
+    assert!(Arc::ptr_eq(&first.manifest, &second.manifest));
+    assert!(Arc::ptr_eq(&dataset.manifest, &first.manifest));
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_tag(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
     data_storage_version: LanceFileVersion,
