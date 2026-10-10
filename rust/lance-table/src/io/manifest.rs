@@ -15,6 +15,7 @@ use prost::Message;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::task::{Context, Poll};
 use std::{ops::Range, sync::Arc};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -25,8 +26,7 @@ use lance_io::{
     encodings::{Encoder, binary::BinaryEncoder, plain::PlainEncoder},
     object_store::ObjectStore,
     object_writer::WriteResult,
-    traits::{WriteExt, Writer},
-    utils::read_message,
+    traits::{Reader, WriteExt, Writer},
 };
 
 use crate::format::{
@@ -101,20 +101,152 @@ pub async fn read_manifest(
         buf2.freeze()
     };
 
-    let recorded_length = LittleEndian::read_u32(&buf[0..4]) as usize;
-    // Need to trim the magic number at end and message length at beginning
-    let buf = buf.slice(4..buf.len() - 16);
+    let proto = pb::Manifest::decode(manifest_message_body(buf)?)?;
+    Manifest::try_from(proto)
+}
 
-    if buf.len() != recorded_length {
+/// Bytes of the little-endian u32 length prefix that precedes every section
+/// message of a manifest file (index section, inline transaction, manifest).
+const LEN_PREFIX_LEN: usize = 4;
+
+/// Bytes of the footer that follows the manifest message: its i64 position,
+/// the u16 major and minor versions and the magic.
+const FOOTER_LEN: usize = 16;
+
+/// Whether `recorded`, a section message's u32 length prefix, is valid for a
+/// message of `actual` bytes: the prefix holds the length modulo 2^32.
+///
+/// The prefix of a message over [`u32::MAX`] bytes keeps only the low 32 bits
+/// of its length (see [`section_len_prefix`]), so readers take the length from
+/// the file layout and check the prefix against it. Any other mismatch means
+/// the file is corrupt or the message is not where the layout says.
+pub fn section_len_matches(recorded: u32, actual: usize) -> bool {
+    // Truncation intended: compare the low 32 bits.
+    actual as u32 == recorded
+}
+
+/// The body of the manifest message, given the bytes of a manifest file from
+/// the message's position (its length prefix) to the end of the file.
+///
+/// The message runs up to the footer, so its length is known from the layout;
+/// the prefix is checked against it with [`section_len_matches`].
+pub fn manifest_message_body(tail: Bytes) -> Result<Bytes> {
+    if tail.len() < LEN_PREFIX_LEN + FOOTER_LEN {
         return Err(Error::invalid_input(format!(
-            "Invalid format: manifest length does not match. Expected {}, got {}",
-            recorded_length,
-            buf.len()
+            "Invalid format: manifest message and footer take {} bytes, fewer than the {} \
+             of a length prefix and footer",
+            tail.len(),
+            LEN_PREFIX_LEN + FOOTER_LEN
         )));
     }
+    let recorded = LittleEndian::read_u32(&tail[..LEN_PREFIX_LEN]);
+    let body = tail.slice(LEN_PREFIX_LEN..tail.len() - FOOTER_LEN);
+    if !section_len_matches(recorded, body.len()) {
+        return Err(Error::invalid_input(format!(
+            "Invalid format: manifest length does not match. Expected {} (mod 2^32), got {}",
+            recorded,
+            body.len()
+        )));
+    }
+    Ok(body)
+}
 
-    let proto = pb::Manifest::decode(buf)?;
-    Manifest::try_from(proto)
+/// Read the section message (index section or inline transaction) at `pos`
+/// of a manifest file.
+///
+/// `next_section` is the position of the section written right after it, if
+/// any; otherwise the manifest message follows it, at the position the footer
+/// records.
+///
+/// The length is taken from the u32 prefix whenever the rest of the file is
+/// too short for the true length to be 2^32 or more bytes longer. Otherwise
+/// the length is the distance to the next section, checked against the prefix
+/// with [`section_len_matches`].
+///
+/// Fails with "file size is too small" when `reader`'s size ends before the
+/// message does, as a stale cached size would.
+pub async fn read_section_message<M: Message + Default>(
+    reader: &dyn Reader,
+    pos: usize,
+    next_section: Option<usize>,
+) -> Result<M> {
+    let file_size = reader.size().await?;
+    if pos + LEN_PREFIX_LEN > file_size {
+        return Err(Error::io("file size is too small".to_string()));
+    }
+    let first = pos..file_size.min(pos + reader.block_size());
+    let buf = reader.get_range(first.clone()).await?;
+    let recorded = LittleEndian::read_u32(&buf);
+    let len = section_message_len(reader, pos, file_size, recorded, next_section).await?;
+
+    let end = pos + LEN_PREFIX_LEN + len;
+    if end > file_size {
+        return Err(Error::io("file size is too small".to_string()));
+    }
+    let buf = if end <= first.end {
+        buf
+    } else {
+        let rest = reader.get_range(first.end..end).await?;
+        let mut joined = BytesMut::with_capacity(end - pos);
+        joined.extend_from_slice(&buf);
+        joined.extend_from_slice(&rest);
+        joined.freeze()
+    };
+    Ok(M::decode(&buf[LEN_PREFIX_LEN..LEN_PREFIX_LEN + len])?)
+}
+
+/// The length of the section message at `pos` whose u32 prefix is `recorded`;
+/// see [`read_section_message`].
+async fn section_message_len(
+    reader: &dyn Reader,
+    pos: usize,
+    file_size: usize,
+    recorded: u32,
+    next_section: Option<usize>,
+) -> Result<usize> {
+    // A manifest message (at least its prefix) and the footer follow every section.
+    let room = file_size.saturating_sub(pos + LEN_PREFIX_LEN + LEN_PREFIX_LEN + FOOTER_LEN);
+    if !may_exceed_u32_prefix(recorded, room) {
+        return Ok(recorded as usize);
+    }
+    let end = match next_section.filter(|&next| next > pos) {
+        Some(next) => next,
+        None => read_manifest_position(reader, file_size).await?,
+    };
+    let actual = end.checked_sub(pos + LEN_PREFIX_LEN).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "Invalid format: section at {pos} ends at {end}, before its length prefix does"
+        ))
+    })?;
+    if !section_len_matches(recorded, actual) {
+        return Err(Error::invalid_input(format!(
+            "Invalid format: section length does not match. Expected {recorded} (mod 2^32), \
+             got {actual}"
+        )));
+    }
+    Ok(actual)
+}
+
+/// Whether a message with u32 prefix `recorded` and at most `room` bytes could
+/// be 2^32 or more bytes longer than the prefix says.
+fn may_exceed_u32_prefix(recorded: u32, room: usize) -> bool {
+    (recorded as u64) + (1u64 << 32) <= room as u64
+}
+
+/// The manifest message's position, read from the footer at the end of a
+/// manifest file of `file_size` bytes.
+async fn read_manifest_position(reader: &dyn Reader, file_size: usize) -> Result<usize> {
+    let footer = reader
+        .get_range(file_size.saturating_sub(FOOTER_LEN)..file_size)
+        .await?;
+    if footer.len() < FOOTER_LEN || !footer.ends_with(MAGIC) {
+        return Err(Error::io(
+            "manifest footer not found at the end of the reader: file size is too small or the \
+             file is corrupt"
+                .to_string(),
+        ));
+    }
+    Ok(LittleEndian::read_i64(&footer[..8]) as usize)
 }
 
 #[instrument(level = "debug", skip(object_store, manifest))]
@@ -124,7 +256,9 @@ pub async fn read_manifest_indexes(
     manifest: &Manifest,
 ) -> Result<Vec<IndexMetadata>> {
     if let Some(pos) = manifest.index_section.as_ref() {
-        let result = read_index_section(object_store, &location.path, location.size, *pos).await;
+        let next = manifest.transaction_section;
+        let result =
+            read_index_section(object_store, &location.path, location.size, *pos, next).await;
         // A stale cached size makes the index offset fall outside the sized view,
         // so the read fails as "file size is too small". Retry once with the true
         // size; surface any other error unchanged.
@@ -132,7 +266,7 @@ pub async fn read_manifest_indexes(
             Err(e)
                 if location.size.is_some() && e.to_string().contains("file size is too small") =>
             {
-                read_index_section(object_store, &location.path, None, *pos).await?
+                read_index_section(object_store, &location.path, None, *pos, next).await?
             }
             other => other?,
         };
@@ -148,20 +282,22 @@ pub async fn read_manifest_indexes(
     }
 }
 
-/// Read the index section message at `pos`, opening the manifest with a known
-/// size when one is provided.
+/// Read the index section message at `pos`, followed by the section at
+/// `next_section` (if any), opening the manifest with a known size when one is
+/// provided.
 async fn read_index_section(
     object_store: &ObjectStore,
     path: &Path,
     size: Option<u64>,
     pos: usize,
+    next_section: Option<usize>,
 ) -> Result<pb::IndexSection> {
     let reader = if let Some(size) = size {
         object_store.open_with_size(path, size as usize).await?
     } else {
         object_store.open(path).await?
     };
-    read_message(reader.as_ref(), pos).await
+    read_section_message(reader.as_ref(), pos, next_section).await
 }
 
 /// Write the index section and inline transaction, if present, and record
@@ -177,7 +313,7 @@ async fn write_index_and_transaction(
         let section = pb::IndexSection {
             indices: indices.iter().map(|i| i.into()).collect(),
         };
-        let pos = writer.write_protobuf(&section).await?;
+        let pos = write_section_message(writer, "Index section", &section).await?;
         manifest.index_section = Some(pos);
     }
 
@@ -185,28 +321,74 @@ async fn write_index_and_transaction(
     if let Some(tx) = transaction.take() {
         // Convert to protobuf at the write boundary to persist inline
         let pb_tx: pb::Transaction = tx.into();
-        let pos = writer.write_protobuf(&pb_tx).await?;
+        let pos = write_section_message(writer, "Inline transaction", &pb_tx).await?;
         manifest.transaction_section = Some(pos);
     }
     Ok(())
+}
+
+/// Write `message` preceded by its u32 little-endian length prefix (see
+/// [`section_len_prefix`]) and return its position.
+async fn write_section_message(
+    writer: &mut dyn Writer,
+    what: &str,
+    message: &impl Message,
+) -> Result<usize> {
+    let pos = writer.tell().await?;
+    let body = message.encode_to_vec();
+    let prefix = section_len_prefix(what, body.len())?;
+    writer.write_all(&prefix.to_le_bytes()).await?;
+    writer.write_all(&body).await?;
+    Ok(pos)
 }
 
 /// Field key of `Manifest.fragments` in table.proto: field 2, wire type 2
 /// (length-delimited).
 const MANIFEST_FRAGMENTS_KEY: u8 = (2 << 3) | 2;
 
-/// The u32 length prefix of a manifest message of `len` bytes.
-///
-/// Readers take the prefix as the message length, so a message that does not
-/// fit in a u32 cannot be written.
-fn manifest_message_len_prefix(len: usize) -> Result<u32> {
-    u32::try_from(len).map_err(|_| {
-        Error::invalid_input(format!(
-            "Manifest message is {len} bytes, which exceeds the {} byte limit of its \
-             u32 length prefix",
-            u32::MAX
-        ))
+/// Environment variable that lets writers emit section messages (the manifest
+/// message, index section and inline transaction) larger than [`u32::MAX`]
+/// bytes. See [`section_len_prefix`].
+pub const ALLOW_LARGE_MANIFEST_ENV: &str = "LANCE_ALLOW_LARGE_MANIFEST";
+
+/// Whether [`ALLOW_LARGE_MANIFEST_ENV`] is set to `1` or `true`. Read once
+/// per process.
+fn large_manifest_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| {
+        std::env::var(ALLOW_LARGE_MANIFEST_ENV).is_ok_and(|value| {
+            let value = value.trim();
+            value == "1" || value.eq_ignore_ascii_case("true")
+        })
     })
+}
+
+/// The u32 length prefix of a section message (`what`, for errors) of `len`
+/// bytes.
+///
+/// A message over [`u32::MAX`] bytes is an error unless the environment
+/// variable `LANCE_ALLOW_LARGE_MANIFEST` is `1` (read once per process); then
+/// the prefix is the low 32 bits of the length. Readers that check the prefix
+/// with [`section_len_matches`] take the true length from the file layout,
+/// but older readers reject such a file or misread it, so set the variable
+/// only once every reader of the table accepts it.
+fn section_len_prefix(what: &str, len: usize) -> Result<u32> {
+    section_len_prefix_with(what, len, large_manifest_allowed())
+}
+
+/// [`section_len_prefix`], with `allow_large` in place of the environment.
+fn section_len_prefix_with(what: &str, len: usize, allow_large: bool) -> Result<u32> {
+    match u32::try_from(len) {
+        Ok(prefix) => Ok(prefix),
+        // Truncation intended: the prefix holds the length modulo 2^32.
+        Err(_) if allow_large => Ok(len as u32),
+        Err(_) => Err(Error::invalid_input(format!(
+            "{what} is {len} bytes, which exceeds the {} byte limit of its u32 length \
+             prefix. Set {ALLOW_LARGE_MANIFEST_ENV}=1 to write it with the low 32 bits of its \
+             length once every reader of the table derives the length from the file layout",
+            u32::MAX
+        ))),
+    }
 }
 
 /// Whether any data file of `fragment` has an unknown size.
@@ -293,7 +475,7 @@ fn encode_manifest_message(
 
     rest.encode(buf)?;
 
-    let msg_len = manifest_message_len_prefix(buf.len() - msg_start)?;
+    let msg_len = section_len_prefix("Manifest message", buf.len() - msg_start)?;
     buf[len_pos..msg_start].copy_from_slice(&msg_len.to_le_bytes());
     Ok(ranges)
 }
@@ -770,15 +952,244 @@ mod test {
     }
 
     #[test]
-    fn test_manifest_message_len_prefix_rejects_oversized_messages() {
-        assert_eq!(manifest_message_len_prefix(0).unwrap(), 0);
-        assert_eq!(
-            manifest_message_len_prefix(u32::MAX as usize).unwrap(),
-            u32::MAX
-        );
-        let err = manifest_message_len_prefix(u32::MAX as usize + 1).unwrap_err();
+    fn test_section_len_prefix_requires_opt_in_above_u32_max() {
+        let what = "Manifest message";
+        for allow_large in [false, true] {
+            assert_eq!(section_len_prefix_with(what, 0, allow_large).unwrap(), 0);
+            assert_eq!(
+                section_len_prefix_with(what, u32::MAX as usize, allow_large).unwrap(),
+                u32::MAX
+            );
+        }
+
+        let len = (1usize << 32) + 7;
+        let err = section_len_prefix_with(what, len, false)
+            .unwrap_err()
+            .to_string();
         assert!(
-            err.to_string().contains("exceeds"),
+            err.contains("exceeds") && err.contains(ALLOW_LARGE_MANIFEST_ENV),
+            "unexpected error: {err}"
+        );
+        // The low 32 bits: the same bytes as a wrapping `len as u32` cast.
+        assert_eq!(section_len_prefix_with(what, len, true).unwrap(), 7);
+        assert_eq!(
+            section_len_prefix_with(what, (2usize << 32) + 7, true).unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn test_section_len_matches_modulo_2_pow_32() {
+        assert!(section_len_matches(0, 0));
+        assert!(section_len_matches(1234, 1234));
+        assert!(!section_len_matches(1234, 1235));
+        assert!(!section_len_matches(1235, 1234));
+        assert!(section_len_matches(u32::MAX, u32::MAX as usize));
+
+        assert!(section_len_matches(5, (1usize << 32) + 5));
+        assert!(section_len_matches(5, (2usize << 32) + 5));
+        assert!(section_len_matches(0, 1usize << 32));
+        assert!(!section_len_matches(6, (1usize << 32) + 5));
+        assert!(!section_len_matches(u32::MAX, 1usize << 32));
+    }
+
+    #[test]
+    fn test_may_exceed_u32_prefix() {
+        assert!(!may_exceed_u32_prefix(0, 0));
+        assert!(!may_exceed_u32_prefix(0, u32::MAX as usize));
+        assert!(may_exceed_u32_prefix(0, 1usize << 32));
+        assert!(!may_exceed_u32_prefix(10, (1usize << 32) + 9));
+        assert!(may_exceed_u32_prefix(10, (1usize << 32) + 10));
+        assert!(!may_exceed_u32_prefix(u32::MAX, (2usize << 32) - 2));
+    }
+
+    /// A manifest file tail: `prefix`, `body_len` zero bytes, then a footer.
+    fn manifest_tail(prefix: u32, body_len: usize) -> Bytes {
+        let mut tail = vec![0u8; LEN_PREFIX_LEN + body_len + FOOTER_LEN];
+        tail[..LEN_PREFIX_LEN].copy_from_slice(&prefix.to_le_bytes());
+        let footer_start = tail.len() - MAGIC.len();
+        tail[footer_start..].copy_from_slice(MAGIC);
+        Bytes::from(tail)
+    }
+
+    #[test]
+    fn test_manifest_message_body_checks_prefix() {
+        let body = manifest_message_body(manifest_tail(100, 100)).unwrap();
+        assert_eq!(body.len(), 100);
+        assert_eq!(manifest_message_body(manifest_tail(0, 0)).unwrap().len(), 0);
+
+        for (prefix, body_len) in [(99, 100), (101, 100), (100 + (1 << 31), 100)] {
+            let err = manifest_message_body(manifest_tail(prefix, body_len))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("manifest length does not match"),
+                "unexpected error: {err}"
+            );
+        }
+
+        let err = manifest_message_body(Bytes::from(vec![0u8; LEN_PREFIX_LEN + FOOTER_LEN - 1]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Invalid format"), "unexpected error: {err}");
+    }
+
+    /// The body of a message over `u32::MAX` bytes is taken from the layout and
+    /// accepted when the prefix holds its low 32 bits. The zeroed buffer is
+    /// allocated lazily and only its first and last pages are touched.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_manifest_message_body_accepts_wrapped_prefix() {
+        let body_len = (1usize << 32) + 8;
+        let body = manifest_message_body(manifest_tail(8, body_len)).unwrap();
+        assert_eq!(body.len(), body_len);
+
+        let err = manifest_message_body(manifest_tail(9, body_len))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("manifest length does not match"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_section_messages() {
+        let store = ObjectStore::memory();
+        let path = Path::from("sections");
+        let transaction = pb::Transaction {
+            read_version: 7,
+            uuid: "transaction".to_string(),
+            ..Default::default()
+        };
+
+        let mut manifest = manifest_with_fragments(10);
+        let mut writer = store.create(&path).await.unwrap();
+        let pos = write_manifest(
+            writer.as_mut(),
+            &mut manifest,
+            Some(vec![]),
+            Some(Transaction::from(transaction.clone())),
+        )
+        .await
+        .unwrap();
+        writer
+            .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+            .await
+            .unwrap();
+        Writer::shutdown(writer.as_mut()).await.unwrap();
+
+        let read_back = read_manifest(&store, &path, None).await.unwrap();
+        assert_eq!(read_back, manifest);
+        let index_pos = read_back.index_section.unwrap();
+        let transaction_pos = read_back.transaction_section.unwrap();
+
+        let reader = store.open(&path).await.unwrap();
+        let section: pb::IndexSection =
+            read_section_message(reader.as_ref(), index_pos, Some(transaction_pos))
+                .await
+                .unwrap();
+        assert_eq!(section, pb::IndexSection { indices: vec![] });
+        let read_transaction: pb::Transaction =
+            read_section_message(reader.as_ref(), transaction_pos, None)
+                .await
+                .unwrap();
+        assert_eq!(read_transaction, transaction);
+
+        // A reader whose size ends inside the message reports a too-small size.
+        let short = store
+            .open_with_size(&path, transaction_pos + LEN_PREFIX_LEN + 1)
+            .await
+            .unwrap();
+        let err = read_section_message::<pb::Transaction>(short.as_ref(), transaction_pos, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("file size is too small"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Append `message` followed by an unknown length-delimited field of
+    /// `padding` bytes, which decoders skip, and return the message length.
+    #[cfg(unix)]
+    fn write_padded_message(
+        file: &mut std::fs::File,
+        message: &impl Message,
+        padding: usize,
+    ) -> usize {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let mut head = message.encode_to_vec();
+        prost::encoding::encode_key(
+            (1 << 29) - 1,
+            prost::encoding::WireType::LengthDelimited,
+            &mut head,
+        );
+        prost::encoding::encode_varint(padding as u64, &mut head);
+        let len = head.len() + padding;
+        file.write_all(&(len as u32).to_le_bytes()).unwrap();
+        file.write_all(&head).unwrap();
+        // Leave a hole: the file system reads it back as zeros.
+        file.seek(SeekFrom::Current(padding as i64)).unwrap();
+        len
+    }
+
+    /// Reads a manifest file whose inline transaction and manifest message are
+    /// both larger than `u32::MAX` bytes, with prefixes holding the low 32 bits
+    /// of their lengths. The file is sparse, but each read holds up to two
+    /// copies of a 4 GiB message in memory, so the test is not run by default.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "reads two messages over 4 GiB; needs about 10 GiB of memory"]
+    async fn test_read_manifest_file_with_messages_over_4_gib() {
+        use std::io::Write;
+
+        let padding = (1usize << 32) + 1000;
+        let dir = lance_core::utils::tempfile::TempDir::try_new().unwrap();
+        let file_path = dir.std_path().join("large.manifest");
+        let mut file = std::fs::File::create(&file_path).unwrap();
+
+        let transaction = pb::Transaction {
+            read_version: 7,
+            uuid: "large transaction".to_string(),
+            ..Default::default()
+        };
+        let transaction_len = write_padded_message(&mut file, &transaction, padding);
+        assert!(transaction_len > u32::MAX as usize);
+
+        let mut manifest = manifest_with_fragments(10);
+        manifest.transaction_section = Some(0);
+        let manifest_pos = LEN_PREFIX_LEN + transaction_len;
+        let manifest_len = write_padded_message(&mut file, &pb::Manifest::from(&manifest), padding);
+        assert!(manifest_len > u32::MAX as usize);
+
+        file.write_all(&(manifest_pos as i64).to_le_bytes())
+            .unwrap();
+        file.write_all(&MAJOR_VERSION.to_le_bytes()).unwrap();
+        file.write_all(&MINOR_VERSION.to_le_bytes()).unwrap();
+        file.write_all(MAGIC).unwrap();
+        drop(file);
+
+        let (store, path) = ObjectStore::from_uri(file_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let read_back = read_manifest(&store, &path, None).await.unwrap();
+        assert_eq!(read_back, manifest);
+
+        let reader = store.open(&path).await.unwrap();
+        let read_transaction: pb::Transaction = read_section_message(reader.as_ref(), 0, None)
+            .await
+            .unwrap();
+        assert_eq!(read_transaction, transaction);
+
+        // A next section that disagrees with the prefix is rejected.
+        let err =
+            read_section_message::<pb::Transaction>(reader.as_ref(), 0, Some(manifest_pos - 1))
+                .await
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("section length does not match"),
             "unexpected error: {err}"
         );
     }
